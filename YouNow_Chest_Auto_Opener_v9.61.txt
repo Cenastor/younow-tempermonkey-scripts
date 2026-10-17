@@ -1,0 +1,5402 @@
+// ==UserScript==
+// @name         YouNow Treasure Chest Auto Opener
+// @namespace    https://younow.com/
+// @version      9.61
+// @description  YouNow Treasure Chest automation with live chest likes detection, v9.50 base with live likes-check window, timer-driven chest-panel likes checks, and optional custom chest-open audio, reliable Winners-panel cleanup, and persistent chest history.
+// @author       James McKay
+// @match        https://www.younow.com/*
+// @match        https://younow.com/*
+// @grant        GM_getValue
+// @grant        GM_setValue
+// @grant        GM_addStyle
+// @run-at       document-idle
+// ==/UserScript==
+
+(function () {
+    "use strict";
+
+    const VERSION = "9.62";
+
+    /*
+     * Keep the existing storage key for compatibility.
+     */
+    const STORAGE_KEY =
+        "younowTreasureChestAutoOpener_v920";
+
+    /*
+     * Opened chest history is stored separately from settings so
+     * RESET LOG never changes automation settings.
+     */
+    const LOG_STORAGE_KEY =
+        STORAGE_KEY + "_openedChestLog";
+
+    const MAX_LOG_ENTRIES = 100;
+
+    /*
+     * While a chest likes check is active, keep the real chest panel
+     * open for a short live-check window. This catches likes that arrive
+     * while the check is in progress instead of closing the panel on the
+     * first below-target reading. It is a bounded check, not a recheck timer.
+     */
+    const LIVE_LIKES_CHECK_WINDOW_MS = 5000;
+
+    const DEFAULTS = {
+        enabled: true,
+
+        threshold: 1000,
+
+        recheckSeconds: 30,
+
+        openingDelaySeconds: 30,
+
+        timerEnabled: true,
+
+        openingChatEnabled: true,
+
+        openingChatMessage:
+            "Treasure Chest has reached {likes} likes! Opening in {delay} seconds! ❤️",
+
+        openSoundEnabled: true,
+
+        openSoundVolume: 0.80,
+
+        autoInfoEnabled: true,
+
+        autoInfoMinutes: 5,
+
+        autoInfoMessage:
+            "Auto Chest: The chest opens automatically at {threshold} likes. Current target: {threshold} likes! ❤️",
+
+        minimized: false,
+
+        maximized: false,
+
+        panelX: null,
+
+        panelY: null
+    };
+
+    let settings = loadSettings();
+
+    /*
+     * ============================================================
+     * CUSTOM CHEST-OPEN SOUND
+     * ============================================================
+     * Selected audio is stored in IndexedDB so it survives reloads.
+     * Audio initialization never controls whether the helper panel
+     * itself is created or shown.
+     */
+    const SOUND_DB_NAME = "YouNowChestHelperSoundDB";
+    const SOUND_DB_VERSION = 1;
+    const SOUND_STORE_NAME = "sound";
+    const SOUND_RECORD_KEY = "openSound";
+
+    let customOpenSoundName = "";
+    let customOpenSoundObjectUrl = null;
+    let soundAudio = null;
+    let soundReady = false;
+    let soundPlayedForCycle = false;
+
+    function openSoundDatabase() {
+        return new Promise((resolve, reject) => {
+            try {
+                const request = indexedDB.open(SOUND_DB_NAME, SOUND_DB_VERSION);
+                request.onupgradeneeded = () => {
+                    const db = request.result;
+                    if (!db.objectStoreNames.contains(SOUND_STORE_NAME)) {
+                        db.createObjectStore(SOUND_STORE_NAME);
+                    }
+                };
+                request.onsuccess = () => resolve(request.result);
+                request.onerror = () => reject(request.error);
+            } catch (error) {
+                reject(error);
+            }
+        });
+    }
+
+    async function saveCustomOpenSound(file) {
+        if (!file) return false;
+        try {
+            const db = await openSoundDatabase();
+            await new Promise((resolve, reject) => {
+                const tx = db.transaction(SOUND_STORE_NAME, "readwrite");
+                tx.objectStore(SOUND_STORE_NAME).put({
+                    blob: file,
+                    name: file.name || "Custom sound",
+                    type: file.type || "audio/mpeg",
+                    updated: Date.now()
+                }, SOUND_RECORD_KEY);
+                tx.oncomplete = resolve;
+                tx.onerror = () => reject(tx.error);
+            });
+            db.close();
+            await loadCustomOpenSound();
+            setAction(`Custom sound loaded: ${customOpenSoundName}`);
+            return true;
+        } catch (error) {
+            console.error("[Chest Helper] Sound save failed:", error);
+            setAction("Could not save custom sound");
+            return false;
+        }
+    }
+
+    async function loadCustomOpenSound() {
+        try {
+            const db = await openSoundDatabase();
+            const record = await new Promise((resolve, reject) => {
+                const tx = db.transaction(SOUND_STORE_NAME, "readonly");
+                const request = tx.objectStore(SOUND_STORE_NAME).get(SOUND_RECORD_KEY);
+                request.onsuccess = () => resolve(request.result || null);
+                request.onerror = () => reject(request.error);
+            });
+            db.close();
+            if (!record || !record.blob) {
+                customOpenSoundName = "";
+                soundReady = false;
+                return false;
+            }
+            if (customOpenSoundObjectUrl) {
+                try { URL.revokeObjectURL(customOpenSoundObjectUrl); } catch (_) {}
+            }
+            customOpenSoundName = record.name || "Custom sound";
+            customOpenSoundObjectUrl = URL.createObjectURL(record.blob);
+            soundAudio = new Audio(customOpenSoundObjectUrl);
+            soundAudio.preload = "auto";
+            soundAudio.volume = clamp(Number(settings.openSoundVolume), 0, 1);
+            soundReady = true;
+            return true;
+        } catch (error) {
+            console.warn("[Chest Helper] Could not load saved sound:", error);
+            soundReady = false;
+            return false;
+        }
+    }
+
+    async function clearCustomOpenSound() {
+        try {
+            const db = await openSoundDatabase();
+            await new Promise((resolve, reject) => {
+                const tx = db.transaction(SOUND_STORE_NAME, "readwrite");
+                tx.objectStore(SOUND_STORE_NAME).delete(SOUND_RECORD_KEY);
+                tx.oncomplete = resolve;
+                tx.onerror = () => reject(tx.error);
+            });
+            db.close();
+        } catch (error) {
+            console.warn("[Chest Helper] Could not clear sound:", error);
+        }
+        if (customOpenSoundObjectUrl) {
+            try { URL.revokeObjectURL(customOpenSoundObjectUrl); } catch (_) {}
+        }
+        customOpenSoundName = "";
+        customOpenSoundObjectUrl = null;
+        soundAudio = null;
+        soundReady = false;
+        setAction("Custom chest-open sound removed");
+        updateUI();
+    }
+
+    async function playCustomOpenSound(force = false) {
+        if (!detectOwnBroadcasting()) return false;
+        if (!force && !settings.openSoundEnabled) return false;
+        if (!soundReady) await loadCustomOpenSound();
+        if (!soundReady || !customOpenSoundObjectUrl) {
+            setAction("No custom chest-open sound selected");
+            return false;
+        }
+        try {
+            if (!soundAudio) soundAudio = new Audio(customOpenSoundObjectUrl);
+            soundAudio.volume = clamp(Number(settings.openSoundVolume), 0, 1);
+            soundAudio.currentTime = 0;
+            const promise = soundAudio.play();
+            if (promise && typeof promise.then === "function") await promise;
+            setAction(`Playing chest-open sound: ${customOpenSoundName}`);
+            return true;
+        } catch (error) {
+            console.warn("[Chest Helper] Sound playback failed:", error);
+            setAction("Sound playback was blocked — use TEST SOUND once");
+            return false;
+        }
+    }
+
+    async function handleOpenSoundFile(event) {
+        const file = event?.target?.files?.[0];
+        if (!file) return;
+        if (!file.type || !file.type.startsWith("audio/")) {
+            setAction("Please select an audio file");
+            event.target.value = "";
+            return;
+        }
+        await saveCustomOpenSound(file);
+        event.target.value = "";
+        await playCustomOpenSound(true);
+    }
+
+    async function testOpenSound() {
+        await playCustomOpenSound(true);
+    }
+
+    /*
+     * ============================================================
+     * STATES
+     * ============================================================
+     */
+
+    const STATES = {
+        OFF:
+            "OFF",
+
+        WAITING_FOR_CHEST:
+            "WAITING_FOR_CHEST",
+
+        OPENING_PANEL:
+            "OPENING_PANEL",
+
+        READING_LIKES:
+            "READING_LIKES",
+
+        CLOSING_BELOW_TARGET:
+            "CLOSING_BELOW_TARGET",
+
+        WAITING_FOR_RECHECK:
+            "WAITING_FOR_RECHECK",
+
+        WAITING_FOR_OPEN_DELAY:
+            "WAITING_FOR_OPEN_DELAY",
+
+        CLICKING_CHEST:
+            "CLICKING_CHEST",
+
+        CLICKING_OPEN:
+            "CLICKING_OPEN",
+
+        WAITING_FOR_RAIN:
+            "WAITING_FOR_RAIN",
+
+        WAITING_FOR_TELL_THEM:
+            "WAITING_FOR_TELL_THEM",
+
+        WAITING_FOR_CHEST_RESET:
+            "WAITING_FOR_CHEST_RESET",
+
+        WAITING_FOR_WINNERS:
+            "WAITING_FOR_WINNERS",
+
+        CLOSING_WINNERS:
+            "CLOSING_WINNERS",
+
+        CLEANUP:
+            "CLEANUP"
+    };
+
+    let state =
+        settings.enabled
+            ? STATES.WAITING_FOR_CHEST
+            : STATES.OFF;
+
+    /*
+     * ============================================================
+     * CYCLE DATA
+     * ============================================================
+     */
+
+    /*
+     * Completed chest-opening cycle number.
+     * A likes check is NOT a cycle. The number advances only after
+     * the complete chest opening and cleanup sequence succeeds.
+     */
+    let cycle = loadCompletedCycleCount();
+
+    function loadCompletedCycleCount() {
+        try {
+            const stored = parseInt(
+                GM_getValue(
+                    STORAGE_KEY + "_completedCycleCount",
+                    0
+                ),
+                10
+            );
+
+            return Number.isFinite(stored) && stored >= 0
+                ? stored
+                : 0;
+        } catch (_) {
+            return 0;
+        }
+    }
+
+    function saveCompletedCycleCount() {
+        try {
+            GM_setValue(
+                STORAGE_KEY + "_completedCycleCount",
+                cycle
+            );
+        } catch (_) {}
+    }
+
+    function completeChestCycle() {
+        cycle += 1;
+        saveCompletedCycleCount();
+    }
+
+    /*
+     * Current live value from the most recent successful
+     * chest-panel read.
+     */
+    let lastCheckedLikes = null;
+
+    /*
+     * Current value displayed during the cycle.
+     */
+    let currentLikes = null;
+
+    /*
+     * Value locked when the threshold is reached.
+     */
+    let lockedLikes = null;
+
+    let likesLockedForCycle =
+        false;
+
+    let cycleLocked =
+        false;
+
+    /*
+     * A check cycle is one complete timer-driven operation:
+     * timer expires -> open panel -> READ the real likes -> close panel.
+     * It prevents the panel from being opened/closed repeatedly while
+     * waiting for the next scheduled check.
+     */
+    let checkCycleInProgress =
+        false;
+
+    let likesReadThisCheck =
+        false;
+
+    /* End time for the short live likes-check window. */
+    let likesCheckDeadline = null;
+
+    let openingChatSent =
+        false;
+
+    /*
+     * Opened-chest history.  Entries are added only after the
+     * complete opening/Winners cleanup sequence succeeds.
+     */
+    let chestLog =
+        loadChestLog();
+
+    let openedChestRecordedForCycle =
+        false;
+
+    /*
+     * ============================================================
+     * TIMERS
+     * ============================================================
+     */
+
+    let chestTimerEnd = null;
+
+    let openingTimerEnd = null;
+
+    let autoInfoNextAt = null;
+
+    /*
+     * ============================================================
+     * STATUS
+     * ============================================================
+     */
+
+    let lastAction =
+        "Starting...";
+
+    let stateStartedAt =
+        Date.now();
+
+    let recoveryStartedAt =
+        Date.now();
+
+    /*
+     * ============================================================
+     * WINNERS
+     * ============================================================
+     */
+
+    let winnerCloseAttempts = 0;
+
+    /*
+     * ============================================================
+     * UI
+     * ============================================================
+     */
+
+    let helperPanel = null;
+
+    let dragState = {
+        active: false,
+        offsetX: 0,
+        offsetY: 0
+    };
+
+    /*
+     * ============================================================
+     * ASYNC PROCESS LOCK
+     *
+     * processState() contains awaited DOM operations. The 500 ms
+     * polling loop must never run a second processState() while the
+     * previous one is still waiting on a panel open/close/read.
+     * Without this lock, overlapping calls can click the chest
+     * button repeatedly and create an open/close loop.
+     * ============================================================
+     */
+    let processStateBusy = false;
+
+    /* BROADCAST SAFETY: visible YouNow END button = live. */
+    let ownBroadcastActive = false;
+    let broadcastDetectionInitialized = false;
+
+    /* TIMER-OFF CONTROL: no timer; check once on AVAILABLE and once before opening. */
+    let lastObservedChestState = "UNKNOWN";
+    let offModeCheckedForAvailableChest = false;
+    let preOpenVerification = false;
+
+    /*
+     * ============================================================
+     * SETTINGS
+     * ============================================================
+     */
+
+    function loadSettings() {
+        let stored = {};
+
+        try {
+            stored =
+                GM_getValue(
+                    STORAGE_KEY,
+                    {}
+                ) || {};
+        } catch (error) {
+            console.warn(
+                "[Chest Helper] Could not load settings:",
+                error
+            );
+        }
+
+        const result = {
+            ...DEFAULTS,
+            ...stored
+        };
+
+        result.threshold =
+            clampThreshold(
+                result.threshold
+            );
+
+        result.recheckSeconds =
+            Math.max(
+                1,
+                parseInt(
+                    result.recheckSeconds,
+                    10
+                ) || 30
+            );
+
+        result.openingDelaySeconds =
+            Math.max(
+                0,
+                parseInt(
+                    result.openingDelaySeconds,
+                    10
+                ) || 0
+            );
+
+        result.autoInfoMinutes =
+            Math.max(
+                1,
+                parseInt(
+                    result.autoInfoMinutes,
+                    10
+                ) || 5
+            );
+
+        result.openSoundEnabled =
+            result.openSoundEnabled !== false;
+
+        result.openSoundVolume =
+            clamp(
+                Number(result.openSoundVolume),
+                0,
+                1
+            );
+
+        return result;
+    }
+
+    function saveSettings() {
+        try {
+            GM_setValue(
+                STORAGE_KEY,
+                settings
+            );
+        } catch (error) {
+            console.warn(
+                "[Chest Helper] Could not save settings:",
+                error
+            );
+        }
+    }
+
+    function clampThreshold(value) {
+        const number =
+            parseInt(
+                value,
+                10
+            );
+
+        if (
+            !Number.isFinite(number) ||
+            number < 500
+        ) {
+            return 500;
+        }
+
+        return number;
+    }
+
+    /*
+     * ============================================================
+     * OPENED CHEST HISTORY / LOG
+     * ============================================================
+     */
+
+    function loadChestLog() {
+        try {
+            const stored =
+                GM_getValue(
+                    LOG_STORAGE_KEY,
+                    []
+                );
+
+            if (!Array.isArray(stored)) {
+                return [];
+            }
+
+            return stored
+                .filter(entry => entry && typeof entry === "object")
+                .slice(0, MAX_LOG_ENTRIES);
+        } catch (error) {
+            console.warn(
+                "[Chest Helper] Could not load chest history:",
+                error
+            );
+
+            return [];
+        }
+    }
+
+    function saveChestLog() {
+        try {
+            GM_setValue(
+                LOG_STORAGE_KEY,
+                chestLog.slice(0, MAX_LOG_ENTRIES)
+            );
+        } catch (error) {
+            console.warn(
+                "[Chest Helper] Could not save chest history:",
+                error
+            );
+        }
+    }
+
+    function addOpenedChestLog() {
+        if (openedChestRecordedForCycle) {
+            return;
+        }
+
+        const likes =
+            lockedLikes !== null
+                ? lockedLikes
+                : lastCheckedLikes;
+
+        chestLog.unshift({
+            timestamp: Date.now(),
+            cycle: cycle,
+            likes: likes,
+            threshold: Number(settings.threshold),
+            openingDelay: Number(settings.openingDelaySeconds),
+            result: "Opened"
+        });
+
+        chestLog =
+            chestLog.slice(0, MAX_LOG_ENTRIES);
+
+        saveChestLog();
+
+        openedChestRecordedForCycle =
+            true;
+
+        setAction(
+            `Cycle ${cycle} recorded in Chest History`
+        );
+    }
+
+    function resetChestLog() {
+        chestLog = [];
+        saveChestLog();
+        renderChestLog();
+
+        setAction(
+            "Chest History reset"
+        );
+    }
+
+    function formatLogDate(timestamp) {
+        const date =
+            new Date(timestamp);
+
+        if (Number.isNaN(date.getTime())) {
+            return "Unknown date";
+        }
+
+        return date.toLocaleString(
+            undefined,
+            {
+                dateStyle: "short",
+                timeStyle: "medium"
+            }
+        );
+    }
+
+    function escapeHtml(value) {
+        return String(value ?? "")
+            .replace(/&/g, "&amp;")
+            .replace(/</g, "&lt;")
+            .replace(/>/g, "&gt;")
+            .replace(/"/g, "&quot;")
+            .replace(/'/g, "&#039;");
+    }
+
+    function renderChestLog() {
+        if (!helperPanel) {
+            return;
+        }
+
+        const container =
+            helperPanel.querySelector(
+                '[data-field="chest-log"]'
+            );
+
+        const count =
+            helperPanel.querySelector(
+                '[data-field="chest-log-count"]'
+            );
+
+        if (!container) {
+            return;
+        }
+
+        if (count) {
+            count.textContent =
+                String(chestLog.length);
+        }
+
+        if (!chestLog.length) {
+            container.innerHTML =
+                '<div class="ych-log-empty">No opened chests recorded yet.</div>';
+            return;
+        }
+
+        container.innerHTML =
+            chestLog
+                .map((entry, index) => {
+                    const likes =
+                        Number.isFinite(Number(entry.likes))
+                            ? formatLikes(Number(entry.likes))
+                            : "—";
+
+                    const threshold =
+                        Number.isFinite(Number(entry.threshold))
+                            ? formatLikes(Number(entry.threshold))
+                            : "—";
+
+                    const delay =
+                        Number.isFinite(Number(entry.openingDelay))
+                            ? `${Number(entry.openingDelay)}s`
+                            : "—";
+
+                    return `
+                        <div class="ych-log-entry">
+                            <div class="ych-log-top">
+                                <strong>Chest #${escapeHtml(entry.cycle)}</strong>
+                                <span>${escapeHtml(entry.result || "Opened")}</span>
+                            </div>
+                            <div class="ych-log-time">${escapeHtml(formatLogDate(entry.timestamp))}</div>
+                            <div class="ych-log-details">
+                                <span>Likes: <b>${escapeHtml(likes)}</b></span>
+                                <span>Target: <b>${escapeHtml(threshold)}</b></span>
+                                <span>Delay: <b>${escapeHtml(delay)}</b></span>
+                            </div>
+                        </div>
+                    `;
+                })
+                .join("");
+    }
+
+    /*
+     * ============================================================
+     * BASIC HELPERS
+     * ============================================================
+     */
+
+    function sleep(ms) {
+        return new Promise(
+            resolve =>
+                setTimeout(
+                    resolve,
+                    ms
+                )
+        );
+    }
+
+    function normalizeText(value) {
+        return String(
+            value || ""
+        )
+            .replace(
+                /\u00a0/g,
+                " "
+            )
+            .replace(
+                /\s+/g,
+                " "
+            )
+            .trim()
+            .toLowerCase();
+    }
+
+    function isVisible(element) {
+        if (!element) {
+            return false;
+        }
+
+        try {
+            const style =
+                window.getComputedStyle(
+                    element
+                );
+
+            if (
+                style.display ===
+                    "none" ||
+                style.visibility ===
+                    "hidden" ||
+                style.opacity ===
+                    "0"
+            ) {
+                return false;
+            }
+
+            const rect =
+                element.getBoundingClientRect();
+
+            return (
+                rect.width > 0 &&
+                rect.height > 0
+            );
+        } catch (_) {
+            return false;
+        }
+    }
+
+    function clamp(value, min, max) {
+        return Math.min(max, Math.max(min, Number(value) || 0));
+    }
+
+    function formatLikes(value) {
+        if (
+            value === null ||
+            value === undefined ||
+            !Number.isFinite(
+                Number(value)
+            )
+        ) {
+            return "—";
+        }
+
+        return Number(value)
+            .toLocaleString(
+                "en-US"
+            );
+    }
+
+    function remainingSeconds(
+        end
+    ) {
+        if (!end) {
+            return null;
+        }
+
+        return Math.max(
+            0,
+            Math.ceil(
+                (
+                    end -
+                    Date.now()
+                ) / 1000
+            )
+        );
+    }
+
+    function formatTimer(
+        seconds
+    ) {
+        if (
+            seconds === null ||
+            seconds === undefined
+        ) {
+            return "—";
+        }
+
+        const total =
+            Math.max(
+                0,
+                Math.ceil(
+                    seconds
+                )
+            );
+
+        const minutes =
+            Math.floor(
+                total / 60
+            );
+
+        const secondsPart =
+            total % 60;
+
+        if (minutes > 0) {
+            return (
+                `${minutes}m ` +
+                `${String(
+                    secondsPart
+                ).padStart(
+                    2,
+                    "0"
+                )}s`
+            );
+        }
+
+        return `${secondsPart}s`;
+    }
+
+    function setAction(message) {
+        lastAction =
+            String(
+                message || ""
+            );
+
+        console.log(
+            `[Chest Helper ${VERSION}] ${lastAction}`
+        );
+
+        updateUI();
+    }
+
+    function setState(
+        newState
+    ) {
+        state =
+            newState;
+
+        stateStartedAt =
+            Date.now();
+
+        updateUI();
+    }
+
+    /*
+     * ============================================================
+     * NUMBER PARSING
+     * ============================================================
+     */
+
+    function parseYouNowNumber(
+        value
+    ) {
+        if (
+            value === null ||
+            value === undefined
+        ) {
+            return null;
+        }
+
+        let text =
+            String(value)
+                .trim()
+                .replace(
+                    /\u00a0/g,
+                    " "
+                )
+                .replace(
+                    /\s+/g,
+                    ""
+                )
+                .toUpperCase();
+
+        if (!text) {
+            return null;
+        }
+
+        let multiplier = 1;
+
+        if (
+            text.endsWith("K")
+        ) {
+            multiplier = 1000;
+
+            text =
+                text.slice(
+                    0,
+                    -1
+                );
+        } else if (
+            text.endsWith("M")
+        ) {
+            multiplier = 1000000;
+
+            text =
+                text.slice(
+                    0,
+                    -1
+                );
+        } else if (
+            text.endsWith("B")
+        ) {
+            multiplier = 1000000000;
+
+            text =
+                text.slice(
+                    0,
+                    -1
+                );
+        }
+
+        text =
+            text.replace(
+                /[^0-9.,+-]/g,
+                ""
+            );
+
+        if (!text) {
+            return null;
+        }
+
+        if (
+            text.includes(".") &&
+            text.includes(",")
+        ) {
+            const dot =
+                text.lastIndexOf(".");
+
+            const comma =
+                text.lastIndexOf(",");
+
+            if (
+                dot > comma
+            ) {
+                text =
+                    text.replace(
+                        /,/g,
+                        ""
+                    );
+            } else {
+                text =
+                    text.replace(
+                        /\./g,
+                        ""
+                    );
+
+                text =
+                    text.replace(
+                        ",",
+                        "."
+                    );
+            }
+        } else if (
+            text.includes(",")
+        ) {
+            const pieces =
+                text.split(",");
+
+            if (
+                pieces.length > 2 ||
+                pieces[
+                    pieces.length - 1
+                ].length === 3
+            ) {
+                text =
+                    text.replace(
+                        /,/g,
+                        ""
+                    );
+            }
+        } else if (
+            text.includes(".")
+        ) {
+            const pieces =
+                text.split(".");
+
+            if (
+                pieces.length > 2 ||
+                pieces[
+                    pieces.length - 1
+                ].length === 3
+            ) {
+                text =
+                    text.replace(
+                        /\./g,
+                        ""
+                    );
+            }
+        }
+
+        const number =
+            parseFloat(
+                text
+            );
+
+        if (
+            !Number.isFinite(
+                number
+            )
+        ) {
+            return null;
+        }
+
+        return Math.round(
+            number *
+                multiplier
+        );
+    }
+
+    /*
+     * ============================================================
+     * BROADCAST DETECTION / SAFETY
+     * ============================================================
+     */
+
+    function findBroadcastEndButton() {
+        const candidates = Array.from(
+            document.querySelectorAll(
+                'button, [role="button"], input[type="button"], input[type="submit"]'
+            )
+        ).filter(isVisible);
+
+        for (const element of candidates) {
+            const text = normalizeText(element.textContent);
+            const aria = normalizeText(element.getAttribute("aria-label"));
+            const title = normalizeText(element.getAttribute("title"));
+            const value = normalizeText(element.value);
+
+            /* Exact END control only. Do not scan arbitrary page text. */
+            if (text === "end" || aria === "end" || title === "end" || value === "end") {
+                return element;
+            }
+        }
+        return null;
+    }
+
+    function detectOwnBroadcasting() {
+        return Boolean(findBroadcastEndButton());
+    }
+
+    function resetAutomationForNonBroadcast() {
+        chestTimerEnd = null;
+        openingTimerEnd = null;
+        autoInfoNextAt = null;
+        checkCycleInProgress = false;
+        likesReadThisCheck = false;
+        likesCheckDeadline = null;
+        openingChatSent = false;
+        soundPlayedForCycle = false;
+        currentLikes = null;
+        lockedLikes = null;
+        likesLockedForCycle = false;
+        cycleLocked = false;
+        preOpenVerification = false;
+        lastObservedChestState = getChestState();
+        offModeCheckedForAvailableChest = false;
+        state = STATES.OFF;
+    }
+
+    function updateBroadcastSafety() {
+        const live = detectOwnBroadcasting();
+
+        if (!live) {
+            if (ownBroadcastActive || !broadcastDetectionInitialized) {
+                ownBroadcastActive = false;
+                broadcastDetectionInitialized = true;
+                resetAutomationForNonBroadcast();
+                if (settings.enabled) {
+                    setAction("NOT LIVE — automation stopped (END button not found)");
+                }
+            }
+            return false;
+        }
+
+        if (!ownBroadcastActive) {
+            ownBroadcastActive = true;
+            broadcastDetectionInitialized = true;
+            chestTimerEnd = null;
+            openingTimerEnd = null;
+            autoInfoNextAt = null;
+            checkCycleInProgress = false;
+            likesReadThisCheck = false;
+            likesCheckDeadline = null;
+            openingChatSent = false;
+            soundPlayedForCycle = false;
+            currentLikes = null;
+            lockedLikes = null;
+            likesLockedForCycle = false;
+            cycleLocked = false;
+            preOpenVerification = false;
+            /* Force a fresh AVAILABLE check after going live. */
+            lastObservedChestState = "UNKNOWN";
+            offModeCheckedForAvailableChest = false;
+            if (settings.enabled) {
+                state = STATES.WAITING_FOR_CHEST;
+                scheduleAutoInfo();
+                setAction("LIVE — END button detected; automation active");
+            }
+        }
+        return true;
+    }
+
+    /*
+     * ============================================================
+     * ACTUAL CHEST BUTTON
+     * ============================================================
+     */
+
+    function getChestButton() {
+        const buttons =
+            Array.from(
+                document.querySelectorAll(
+                    'button.chest-button[aria-label="Chest button"]'
+                )
+            );
+
+        return (
+            buttons.find(
+                isVisible
+            ) ||
+            buttons[0] ||
+            null
+        );
+    }
+
+    function getChestState() {
+        const button =
+            getChestButton();
+
+        if (!button) {
+            return "UNKNOWN";
+        }
+
+        const image =
+            button.querySelector(
+                'img[alt="Chest state image"]'
+            );
+
+        if (!image) {
+            return "UNKNOWN";
+        }
+
+        const src =
+            image.currentSrc ||
+            image.src ||
+            "";
+
+        if (
+            src.includes(
+                "/available.svg"
+            )
+        ) {
+            return "AVAILABLE";
+        }
+
+        if (
+            src.includes(
+                "/unavailable.svg"
+            )
+        ) {
+            return "UNAVAILABLE";
+        }
+
+        return "UNKNOWN";
+    }
+
+    function isChestAvailable() {
+        return (
+            getChestState() ===
+            "AVAILABLE"
+        );
+    }
+
+    /*
+     * ============================================================
+     * TREASURE CHEST MODAL
+     * ============================================================
+     */
+
+    function getTreasureChestModal() {
+        const candidates =
+            Array.from(
+                document.querySelectorAll(
+                    '[role="dialog"], .modal, .dialog, [class*="modal"]'
+                )
+            ).filter(
+                isVisible
+            );
+
+        const chestModal =
+            candidates.find(
+                element => {
+                    const text =
+                        normalizeText(
+                            element.textContent
+                        );
+
+                    return (
+                        text.includes(
+                            "treasure chest"
+                        ) &&
+                        text.includes(
+                            "open"
+                        ) &&
+                        text.includes(
+                            "cancel"
+                        )
+                    );
+                }
+            );
+
+        return (
+            chestModal ||
+            null
+        );
+    }
+
+    function isChestModalOpen() {
+        return Boolean(
+            getTreasureChestModal()
+        );
+    }
+
+    /*
+     * ============================================================
+     * ACTUAL TREASURE CHEST OPEN/CANCEL MODAL
+     *
+     * This is NOT the sidebar check panel.
+     *
+     * It appears after the actual chest is clicked and contains
+     * the live reward preview plus Open / Cancel.
+     * ============================================================
+     */
+
+    function findChestCancelButton() {
+        const modal =
+            getTreasureChestModal();
+
+        if (!modal) {
+            return null;
+        }
+
+        const buttons =
+            Array.from(
+                modal.querySelectorAll(
+                    'button'
+                )
+            ).filter(
+                isVisible
+            );
+
+        const exact =
+            buttons.find(
+                button =>
+                    normalizeText(
+                        button.textContent
+                    ) ===
+                    "cancel"
+            );
+
+        if (exact) {
+            return exact;
+        }
+
+        return (
+            buttons.find(
+                button => {
+                    const aria =
+                        normalizeText(
+                            button.getAttribute(
+                                "aria-label"
+                            )
+                        );
+
+                    const title =
+                        normalizeText(
+                            button.getAttribute(
+                                "title"
+                            )
+                        );
+
+                    return (
+                        aria === "cancel" ||
+                        title === "cancel"
+                    );
+                }
+            ) ||
+            null
+        );
+    }
+
+    async function closeTreasureChestModal() {
+        for (
+            let attempt = 0;
+            attempt < 3;
+            attempt++
+        ) {
+            if (
+                !isChestModalOpen()
+            ) {
+                return true;
+            }
+
+            const cancel =
+                findChestCancelButton();
+
+            if (!cancel) {
+                setAction(
+                    `Treasure Chest modal: Cancel not found (${attempt + 1}/3)`
+                );
+
+                await sleep(150);
+                continue;
+            }
+
+            try {
+                cancel.click();
+
+                setAction(
+                    `Treasure Chest modal: clicked "Cancel" (${attempt + 1}/3)`
+                );
+            } catch (error) {
+                console.warn(
+                    "[Chest Helper] Treasure Chest modal Cancel failed:",
+                    error
+                );
+            }
+
+            const started =
+                Date.now();
+
+            while (
+                Date.now() -
+                    started <
+                1200
+            ) {
+                if (
+                    !isChestModalOpen()
+                ) {
+                    setAction(
+                        "Treasure Chest modal CLOSED with Cancel"
+                    );
+
+                    return true;
+                }
+
+                await sleep(100);
+            }
+        }
+
+        /*
+         * Final Escape fallback for the actual Open/Cancel modal only.
+         * Never click the chest button to close it.
+         */
+        try {
+            document.dispatchEvent(
+                new KeyboardEvent(
+                    "keydown",
+                    {
+                        key: "Escape",
+                        code: "Escape",
+                        keyCode: 27,
+                        which: 27,
+                        bubbles: true
+                    }
+                )
+            );
+
+            await sleep(250);
+
+            if (
+                !isChestModalOpen()
+            ) {
+                setAction(
+                    "Treasure Chest modal CLOSED with Escape"
+                );
+
+                return true;
+            }
+        } catch (error) {
+            console.warn(
+                "[Chest Helper] Treasure Chest modal Escape failed:",
+                error
+            );
+        }
+
+        return !isChestModalOpen();
+    }
+
+    /*
+     * ============================================================
+     * CHEST CHECK PANEL
+     *
+     * This is the sidebar panel opened by the normal chest button.
+     * It is different from the later Treasure Chest Open/Cancel
+     * dialog used during the actual opening sequence.
+     *
+     * The UNAVAILABLE chest can show the education panel with:
+     *   - Treasure Chest title
+     *   - live likes value
+     *   - "Got it" button
+     *
+     * Therefore availability must NOT be used to decide whether the
+     * check panel exists or whether its likes can be read.
+     * ============================================================
+     */
+
+    function getChestCheckPanel() {
+        const panels =
+            Array.from(
+                document.querySelectorAll(
+                    '.sidebar-modal-chest, app-sidebar-modal-chest-broadcaster-education'
+                )
+            ).filter(
+                isVisible
+            );
+
+        if (!panels.length) {
+            return null;
+        }
+
+        /* Prefer the panel that actually contains the live counter. */
+        const counterPanel =
+            panels.find(
+                panel =>
+                    panel.querySelector(
+                        '.total-likes .value'
+                    )
+            );
+
+        if (counterPanel) {
+            return counterPanel;
+        }
+
+        return panels[0];
+    }
+
+    function isChestCheckPanelOpen() {
+        return Boolean(
+            getChestCheckPanel()
+        );
+    }
+
+    /*
+     * ============================================================
+     * CHEST LIKES
+     *
+     * IMPORTANT:
+     * Only the actual sidebar chest panel is read.
+     * This works for both AVAILABLE and UNAVAILABLE chest panels.
+     * ============================================================
+     */
+
+    function getChestLikes() {
+        if (
+            state !==
+                STATES.READING_LIKES ||
+            likesLockedForCycle
+        ) {
+            return null;
+        }
+
+        const panel =
+            getChestCheckPanel();
+
+        if (!panel) {
+            return null;
+        }
+
+        const valueElement =
+            panel.querySelector(
+                '.total-likes .value'
+            );
+
+        if (
+            !valueElement ||
+            !isVisible(
+                valueElement
+            )
+        ) {
+            return null;
+        }
+
+        const likes =
+            parseYouNowNumber(
+                valueElement.textContent
+            );
+
+        if (
+            likes === null
+        ) {
+            return null;
+        }
+
+        /* THIS is the authoritative value for {likes}. */
+        lastCheckedLikes =
+            likes;
+
+        currentLikes =
+            likes;
+
+        return likes;
+    }
+
+    /*
+     * ============================================================
+     * OPEN CHEST CHECK PANEL
+     * ============================================================
+     */
+
+    async function openChestPanel(allowUnavailable = false) {
+        if (!detectOwnBroadcasting()) {
+            return false;
+        }
+
+        if (
+            isChestCheckPanelOpen()
+        ) {
+            return true;
+        }
+
+        const button =
+            getChestButton();
+
+        if (
+            !button ||
+            !isVisible(button)
+        ) {
+            return false;
+        }
+
+        /*
+         * Normal opening requires AVAILABLE. A scheduled likes check
+         * may explicitly pass allowUnavailable=true so the unavailable
+         * education panel can be opened and its real likes read.
+         */
+        if (
+            !allowUnavailable &&
+            !isChestAvailable()
+        ) {
+            return false;
+        }
+
+        try {
+            button.click();
+        } catch (error) {
+            console.warn(
+                '[Chest Helper] Chest button click failed:',
+                error
+            );
+
+            return false;
+        }
+
+        const started =
+            Date.now();
+
+        while (
+            Date.now() -
+                started <
+            5000
+        ) {
+            if (
+                isChestCheckPanelOpen()
+            ) {
+                return true;
+            }
+
+            await sleep(
+                100
+            );
+        }
+
+        return false;
+    }
+
+    /*
+     * ============================================================
+     * CLOSE CHEST CHECK PANEL
+     *
+     * For an UNAVAILABLE chest the visible close control is the
+     * "Got it" button shown in the education panel. For the normal
+     * chest panel, Cancel is supported as before.
+     *
+     * IMPORTANT: Never click the chest button as a close fallback.
+     * ============================================================
+     */
+
+    function findChestPanelCloseButton() {
+        const panel =
+            getChestCheckPanel();
+
+        if (!panel) {
+            return null;
+        }
+
+        const buttons =
+            Array.from(
+                panel.querySelectorAll(
+                    'button'
+                )
+            ).filter(
+                isVisible
+            );
+
+        /* Unavailable education panel shown in the supplied screenshot. */
+        const gotIt =
+            buttons.find(
+                button =>
+                    normalizeText(
+                        button.textContent
+                    ) ===
+                    'got it'
+            );
+
+        /*
+         * The unavailable chest screenshot shows this exact control.
+         * Prefer it over every other close control.
+         */
+        if (gotIt) {
+            return gotIt;
+        }
+
+        /* Normal panel / legacy close control. */
+        const cancel =
+            buttons.find(
+                button =>
+                    normalizeText(
+                        button.textContent
+                    ) ===
+                    'cancel'
+            );
+
+        if (cancel) {
+            return cancel;
+        }
+
+        const labelledClose =
+            buttons.find(
+                button => {
+                    const aria =
+                        normalizeText(
+                            button.getAttribute(
+                                'aria-label'
+                            )
+                        );
+
+                    const title =
+                        normalizeText(
+                            button.getAttribute(
+                                'title'
+                            )
+                        );
+
+                    return (
+                        aria === 'close' ||
+                        title === 'close'
+                    );
+                }
+            );
+
+        return labelledClose || null;
+    }
+
+    async function closeChestPanel() {
+        for (
+            let attempt = 0;
+            attempt < 3;
+            attempt++
+        ) {
+            if (
+                !isChestCheckPanelOpen()
+            ) {
+                return true;
+            }
+
+            const closeButton =
+                findChestPanelCloseButton();
+
+            if (!closeButton) {
+                setAction(
+                    `Chest panel close control not found (${attempt + 1}/3)`
+                );
+
+                await sleep(150);
+                continue;
+            }
+
+            const label =
+                normalizeText(
+                    closeButton.textContent
+                ) ||
+                closeButton.getAttribute(
+                    'aria-label'
+                ) ||
+                'close';
+
+            const isGotIt =
+                label === 'got it';
+
+            try {
+                closeButton.click();
+
+                setAction(
+                    isGotIt
+                        ? `Unavailable chest: clicked "Got it" after reading likes`
+                        : `Chest panel: clicked "${label}" (${attempt + 1}/3)`
+                );
+            } catch (error) {
+                console.warn(
+                    '[Chest Helper] Chest panel close click failed:',
+                    error
+                );
+            }
+
+            const started =
+                Date.now();
+
+            while (
+                Date.now() -
+                    started <
+                1500
+            ) {
+                if (
+                    !isChestCheckPanelOpen()
+                ) {
+                    setAction(
+                        `Chest panel CLOSED with "${label}"`
+                    );
+
+                    return true;
+                }
+
+                await sleep(100);
+            }
+        }
+
+        /*
+         * Escape is only a final fallback after the panel's own close
+         * control has been attempted. The chest button is NEVER used.
+         */
+        setAction(
+            'Chest panel did not close with its close control — using Escape fallback'
+        );
+
+        document.dispatchEvent(
+            new KeyboardEvent(
+                'keydown',
+                {
+                    key: 'Escape',
+                    code: 'Escape',
+                    keyCode: 27,
+                    which: 27,
+                    bubbles: true,
+                    cancelable: true
+                }
+            )
+        );
+
+        await sleep(600);
+
+        const closed =
+            !isChestCheckPanelOpen();
+
+        if (closed) {
+            setAction(
+                'Chest panel CLOSED with Escape'
+            );
+        } else {
+            setAction(
+                'Chest panel remains open after Escape'
+            );
+        }
+
+        return closed;
+    }
+
+    /*
+     * ============================================================
+     * CHEST LIKES / OPENING MODAL HELPERS
+     *
+     * The functions below intentionally continue using
+     * getTreasureChestModal(). That modal is the separate Open/Cancel
+     * dialog used only after the chest has reached the threshold.
+     * ============================================================
+     */
+
+    /*
+     * ============================================================
+     * OPEN BUTTON
+     * ============================================================
+     */
+
+    function findChestOpenButton() {
+        const modal =
+            getTreasureChestModal();
+
+        if (!modal) {
+            return null;
+        }
+
+        return (
+            Array.from(
+                modal.querySelectorAll(
+                    "button"
+                )
+            )
+                .filter(
+                    isVisible
+                )
+                .find(
+                    button =>
+                        normalizeText(
+                            button.textContent
+                        ) ===
+                        "open"
+                ) ||
+            null
+        );
+    }
+
+    function clickChestOpenButton() {
+        if (!detectOwnBroadcasting()) return false;
+
+        const button =
+            findChestOpenButton();
+
+        if (!button) {
+            return false;
+        }
+
+        try {
+            button.click();
+
+            setAction(
+                "Open clicked"
+            );
+
+            return true;
+        } catch (error) {
+            console.warn(
+                "[Chest Helper] Open failed:",
+                error
+            );
+
+            return false;
+        }
+    }
+
+    /*
+     * ============================================================
+     * MAKE IT RAIN
+     * ============================================================
+     */
+
+    function findMakeItRainButton() {
+        return (
+            Array.from(
+                document.querySelectorAll(
+                    "button"
+                )
+            )
+                .filter(
+                    isVisible
+                )
+                .find(
+                    button =>
+                        normalizeText(
+                            button.textContent
+                        ) ===
+                        "make it rain"
+                ) ||
+            null
+        );
+    }
+
+    function clickMakeItRain() {
+        if (!detectOwnBroadcasting()) return false;
+
+        const button =
+            findMakeItRainButton();
+
+        if (!button) {
+            return false;
+        }
+
+        try {
+            button.click();
+
+            setAction(
+                "Make It Rain clicked"
+            );
+
+            return true;
+        } catch (error) {
+            console.warn(
+                "[Chest Helper] Make It Rain failed:",
+                error
+            );
+
+            return false;
+        }
+    }
+
+    /*
+     * ============================================================
+     * I'LL TELL THEM
+     * ============================================================
+     */
+
+    function findTellThemButton() {
+        return (
+            Array.from(
+                document.querySelectorAll(
+                    "button"
+                )
+            )
+                .filter(
+                    isVisible
+                )
+                .find(
+                    button =>
+                        normalizeText(
+                            button.textContent
+                        ) ===
+                        "i'll tell them!"
+                ) ||
+            null
+        );
+    }
+
+    function clickTellThem() {
+        if (!detectOwnBroadcasting()) return false;
+
+        const button =
+            findTellThemButton();
+
+        if (!button) {
+            return false;
+        }
+
+        try {
+            button.click();
+
+            setAction(
+                "I'll tell them clicked"
+            );
+
+            return true;
+        } catch (error) {
+            console.warn(
+                "[Chest Helper] Tell Them failed:",
+                error
+            );
+
+            return false;
+        }
+    }
+
+    /*
+     * ============================================================
+     * WINNERS PANEL
+     * ============================================================
+     * YouNow's Winners/Experience overlay is not consistently exposed
+     * as one particular class.  Find it from its visible text and then
+     * locate the Close control inside that exact element/ancestor.
+     */
+
+    function getVisibleElementsWithExactText(text) {
+        const wanted = normalizeText(text);
+
+        return Array.from(
+            document.querySelectorAll(
+                "body *"
+            )
+        ).filter(element => {
+            if (!isVisible(element)) {
+                return false;
+            }
+
+            return normalizeText(
+                element.textContent
+            ) === wanted;
+        });
+    }
+
+    function findClickableCloseIn(root) {
+        if (!root) {
+            return null;
+        }
+
+        const controls = Array.from(
+            root.querySelectorAll(
+                "button, [role='button'], a, [tabindex], [aria-label], [title]"
+            )
+        ).filter(isVisible);
+
+        for (const control of controls) {
+            const text = normalizeText(
+                control.textContent
+            );
+            const aria = normalizeText(
+                control.getAttribute("aria-label")
+            );
+            const title = normalizeText(
+                control.getAttribute("title")
+            );
+
+            if (
+                text === "close" ||
+                aria === "close" ||
+                title === "close"
+            ) {
+                return control;
+            }
+        }
+
+        /* Some builds render Close as a non-button element. */
+        const exactClose =
+            getVisibleElementsWithExactText("Close")
+                .find(element =>
+                    root === element ||
+                    root.contains(element)
+                );
+
+        if (exactClose) {
+            return findClickableAncestor(
+                exactClose,
+                root
+            );
+        }
+
+        return null;
+    }
+
+    function findClickableAncestor(element, limitRoot = null) {
+        let current = element;
+        let depth = 0;
+
+        while (
+            current &&
+            current !== document.body &&
+            depth < 8
+        ) {
+            if (
+                current.matches &&
+                current.matches(
+                    "button, [role='button'], a, [tabindex]"
+                ) &&
+                isVisible(current)
+            ) {
+                return current;
+            }
+
+            if (
+                limitRoot &&
+                current === limitRoot
+            ) {
+                break;
+            }
+
+            current = current.parentElement;
+            depth++;
+        }
+
+        return element && isVisible(element)
+            ? element
+            : null;
+    }
+
+    function findWinnersPanel() {
+        /* First choice: the literal Winners! heading. */
+        const winnerLabels =
+            getVisibleElementsWithExactText("Winners!");
+
+        const candidates = [];
+
+        for (const label of winnerLabels) {
+            let current = label.parentElement;
+            let depth = 0;
+
+            while (
+                current &&
+                current !== document.body &&
+                depth < 10
+            ) {
+                const close =
+                    findClickableCloseIn(current);
+
+                if (close) {
+                    candidates.push({
+                        panel: current,
+                        close,
+                        depth,
+                        area: (() => {
+                            const r = current.getBoundingClientRect();
+                            return r.width * r.height;
+                        })()
+                    });
+
+                    /* Stop at the first useful containing panel. */
+                    break;
+                }
+
+                current = current.parentElement;
+                depth++;
+            }
+        }
+
+        /* Fallback for builds that omit the literal Winners! heading. */
+        const generic = Array.from(
+            document.querySelectorAll(
+                '[role="dialog"], .modal, .dialog, [class*="modal"], [class*="drawer"], [class*="panel"]'
+            )
+        ).filter(isVisible);
+
+        for (const element of generic) {
+            const text = normalizeText(
+                element.textContent
+            );
+
+            if (
+                !text.includes("winners") &&
+                !text.includes("experience") &&
+                !text.includes("reward")
+            ) {
+                continue;
+            }
+
+            const close =
+                findClickableCloseIn(element);
+
+            if (close) {
+                const r = element.getBoundingClientRect();
+                candidates.push({
+                    panel: element,
+                    close,
+                    depth: 99,
+                    area: r.width * r.height
+                });
+            }
+        }
+
+        if (!candidates.length) {
+            return null;
+        }
+
+        candidates.sort((a, b) => {
+            if (a.depth !== b.depth) {
+                return a.depth - b.depth;
+            }
+
+            return a.area - b.area;
+        });
+
+        return candidates[0].panel;
+    }
+
+    function findWinnerCloseButton(panel) {
+        if (!panel) {
+            return null;
+        }
+
+        const direct =
+            findClickableCloseIn(panel);
+
+        if (direct) {
+            return direct;
+        }
+
+        /* Last-resort search for a visible exact Close element inside panel. */
+        const exactClose =
+            getVisibleElementsWithExactText("Close")
+                .find(element =>
+                    panel === element ||
+                    panel.contains(element)
+                );
+
+        return exactClose
+            ? findClickableAncestor(
+                exactClose,
+                panel
+            )
+            : null;
+    }
+
+    function clickWinnerCloseControl(button) {
+        if (!button) {
+            return false;
+        }
+
+        try {
+            if (typeof PointerEvent === "function") {
+                button.dispatchEvent(
+                    new PointerEvent("pointerdown", {
+                        bubbles: true,
+                        cancelable: true,
+                        button: 0
+                    })
+                );
+            }
+
+            button.dispatchEvent(
+                new MouseEvent("mousedown", {
+                    bubbles: true,
+                    cancelable: true,
+                    button: 0
+                })
+            );
+
+            if (typeof PointerEvent === "function") {
+                button.dispatchEvent(
+                    new PointerEvent("pointerup", {
+                        bubbles: true,
+                        cancelable: true,
+                        button: 0
+                    })
+                );
+            }
+
+            button.dispatchEvent(
+                new MouseEvent("mouseup", {
+                    bubbles: true,
+                    cancelable: true,
+                    button: 0
+                })
+            );
+
+            button.click();
+
+            return true;
+        } catch (error) {
+            console.warn(
+                "[Chest Helper] Winners close dispatch failed:",
+                error
+            );
+
+            try {
+                button.click();
+                return true;
+            } catch (_) {
+                return false;
+            }
+        }
+    }
+
+    async function closeWinnersPanel() {
+        const panel = findWinnersPanel();
+
+        if (!panel) {
+            winnerCloseAttempts = 0;
+            return true;
+        }
+
+        const close =
+            findWinnerCloseButton(panel);
+
+        if (!close) {
+            winnerCloseAttempts++;
+            setAction(
+                `Winners panel found — Close control not found (${winnerCloseAttempts})`
+            );
+
+            if (winnerCloseAttempts >= 4) {
+                setAction(
+                    "Winners Close control unavailable — using Escape"
+                );
+
+                document.dispatchEvent(
+                    new KeyboardEvent("keydown", {
+                        key: "Escape",
+                        code: "Escape",
+                        keyCode: 27,
+                        which: 27,
+                        bubbles: true,
+                        cancelable: true
+                    })
+                );
+
+                await sleep(500);
+
+                if (!findWinnersPanel()) {
+                    winnerCloseAttempts = 0;
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        winnerCloseAttempts++;
+
+        const clicked =
+            clickWinnerCloseControl(close);
+
+        setAction(
+            clicked
+                ? `Winners Close clicked (${winnerCloseAttempts})`
+                : `Winners Close click failed (${winnerCloseAttempts})`
+        );
+
+        await sleep(500);
+
+        if (!findWinnersPanel()) {
+            winnerCloseAttempts = 0;
+            setAction("Winners panel CLOSED");
+            return true;
+        }
+
+        if (winnerCloseAttempts >= 4) {
+            document.dispatchEvent(
+                new KeyboardEvent("keydown", {
+                    key: "Escape",
+                    code: "Escape",
+                    keyCode: 27,
+                    which: 27,
+                    bubbles: true,
+                    cancelable: true
+                })
+            );
+
+            await sleep(500);
+
+            if (!findWinnersPanel()) {
+                winnerCloseAttempts = 0;
+                setAction("Winners panel CLOSED with Escape");
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /*
+     * ============================================================
+     * CHAT
+     * ============================================================
+     */
+
+    function getChatInput() {
+        const exact =
+            document.querySelector(
+                'textarea[aria-label="Chat input text"]'
+            );
+
+        if (
+            exact &&
+            isVisible(exact)
+        ) {
+            return exact;
+        }
+
+        return (
+            Array.from(
+                document.querySelectorAll(
+                    "textarea"
+                )
+            ).find(
+                textarea => {
+                    if (
+                        !isVisible(
+                            textarea
+                        )
+                    ) {
+                        return false;
+                    }
+
+                    const aria =
+                        textarea.getAttribute(
+                            "aria-label"
+                        ) || "";
+
+                    const placeholder =
+                        textarea.getAttribute(
+                            "placeholder"
+                        ) || "";
+
+                    return (
+                        /chat input/i.test(
+                            aria
+                        ) ||
+                        /chat with/i.test(
+                            placeholder
+                        )
+                    );
+                }
+            ) ||
+            null
+        );
+    }
+
+    function setNativeValue(
+        element,
+        value
+    ) {
+        const prototype =
+            Object.getPrototypeOf(
+                element
+            );
+
+        const descriptor =
+            Object.getOwnPropertyDescriptor(
+                prototype,
+                "value"
+            );
+
+        if (
+            descriptor &&
+            descriptor.set
+        ) {
+            descriptor.set.call(
+                element,
+                value
+            );
+        } else {
+            element.value =
+                value;
+        }
+
+        element.dispatchEvent(
+            new Event(
+                "input",
+                {
+                    bubbles: true
+                }
+            )
+        );
+
+        element.dispatchEvent(
+            new Event(
+                "change",
+                {
+                    bubbles: true
+                }
+            )
+        );
+    }
+
+    function sendChatMessage(
+        message
+    ) {
+        if (!detectOwnBroadcasting()) {
+            setAction("Chat blocked — END button not found");
+            return false;
+        }
+
+        const input =
+            getChatInput();
+
+        if (!input) {
+            setAction(
+                "Chat input not found"
+            );
+
+            return false;
+        }
+
+        try {
+            input.focus();
+
+            setNativeValue(
+                input,
+                message
+            );
+
+            const options = {
+                key: "Enter",
+                code: "Enter",
+                keyCode: 13,
+                which: 13,
+                bubbles: true,
+                cancelable: true
+            };
+
+            input.dispatchEvent(
+                new KeyboardEvent(
+                    "keydown",
+                    options
+                )
+            );
+
+            input.dispatchEvent(
+                new KeyboardEvent(
+                    "keypress",
+                    options
+                )
+            );
+
+            input.dispatchEvent(
+                new KeyboardEvent(
+                    "keyup",
+                    options
+                )
+            );
+
+            setAction(
+                `Chat sent: ${message}`
+            );
+
+            return true;
+        } catch (error) {
+            console.warn(
+                "[Chest Helper] Chat failed:",
+                error
+            );
+
+            return false;
+        }
+    }
+
+    /*
+     * ============================================================
+     * CHAT VARIABLES
+     * ============================================================
+     *
+     * {likes}
+     *     = actual likes from the most recent successful chest
+     *       panel check.
+     *
+     * {threshold}
+     *     = configured threshold.
+     *
+     * {lockedLikes}
+     *     = likes value locked when threshold was reached.
+     *
+     * {delay}
+     *     = configured opening delay.
+     *
+     * {cycle}
+     *     = current cycle number.
+     *
+     * {remaining}
+     *     = current timer remaining.
+     * ============================================================
+     */
+
+    function replaceVariables(
+        message
+    ) {
+
+        /*
+         * IMPORTANT:
+         *
+         * {likes} deliberately uses lastCheckedLikes.
+         *
+         * It does NOT use threshold.
+         * It does NOT use the configured target.
+         * It does NOT scan the page.
+         */
+        const likes =
+            lastCheckedLikes !==
+                null
+                ? lastCheckedLikes
+                : currentLikes;
+
+        const remaining =
+            remainingSeconds(
+                openingTimerEnd
+            ) ??
+            remainingSeconds(
+                chestTimerEnd
+            ) ??
+            0;
+
+        return String(
+            message || ""
+        )
+            .replace(
+                /\{likes\}/gi,
+                formatLikes(
+                    likes
+                )
+            )
+            .replace(
+                /\{threshold\}/gi,
+                formatLikes(
+                    settings.threshold
+                )
+            )
+            .replace(
+                /\{lockedLikes\}/gi,
+                formatLikes(
+                    lockedLikes
+                )
+            )
+            .replace(
+                /\{delay\}/gi,
+                String(
+                    settings.openingDelaySeconds
+                )
+            )
+            .replace(
+                /\{cycle\}/gi,
+                String(cycle)
+            )
+            .replace(
+                /\{remaining\}/gi,
+                String(remaining)
+            );
+    }
+
+    function sendOpeningAnnouncement() {
+        if (
+            !settings.openingChatEnabled ||
+            openingChatSent
+        ) {
+            return;
+        }
+
+        const message =
+            replaceVariables(
+                settings.openingChatMessage
+            );
+
+        if (
+            sendChatMessage(
+                message
+            )
+        ) {
+            openingChatSent =
+                true;
+        }
+    }
+
+    /*
+     * ============================================================
+     * AUTO INFO
+     * ============================================================
+     *
+     * This timer is completely independent of the chest-opening
+     * cycle.
+     * ============================================================
+     */
+
+    function scheduleAutoInfo() {
+        if (
+            !settings.autoInfoEnabled
+        ) {
+            autoInfoNextAt =
+                null;
+
+            return;
+        }
+
+        autoInfoNextAt =
+            Date.now() +
+            settings.autoInfoMinutes *
+                60 *
+                1000;
+    }
+
+    function processAutoInfo() {
+        if (!detectOwnBroadcasting()) {
+            return;
+        }
+
+        if (
+            !settings.autoInfoEnabled
+        ) {
+            return;
+        }
+
+        if (!autoInfoNextAt) {
+            scheduleAutoInfo();
+
+            return;
+        }
+
+        if (
+            Date.now() <
+            autoInfoNextAt
+        ) {
+            return;
+        }
+
+        const message =
+            replaceVariables(
+                settings.autoInfoMessage
+            );
+
+        sendChatMessage(
+            message
+        );
+
+        scheduleAutoInfo();
+    }
+
+    /*
+     * ============================================================
+     * TIMERS
+     * ============================================================
+     */
+
+    function startRecheckTimer() {
+        if (!settings.timerEnabled) {
+            chestTimerEnd = null;
+            return;
+        }
+
+        chestTimerEnd =
+            Date.now() +
+            settings.recheckSeconds *
+                1000;
+
+        setAction(
+            `Recheck timer started: ${settings.recheckSeconds}s`
+        );
+    }
+
+    function startImmediateRecheck() {
+        /* Timer OFF is intentionally a real OFF state, not a 0/1-second timer. */
+        if (!settings.timerEnabled) {
+            chestTimerEnd = null;
+            return;
+        }
+
+        chestTimerEnd = Date.now();
+        setAction("Immediate chest recheck started");
+    }
+
+    function startOpenDelay() {
+        openingTimerEnd =
+            Date.now() +
+            settings.openingDelaySeconds *
+                1000;
+
+        setAction(
+            `Opening delay started: ${settings.openingDelaySeconds}s`
+        );
+    }
+
+    /*
+     * ============================================================
+     * BEGIN FRESH CHEST CYCLE
+     * ============================================================
+     */
+
+    function beginFreshCycle() {
+        /*
+         * This is a likes-check/opening cycle, not a completed chest
+         * cycle. The completed cycle number advances only after the
+         * full opening and cleanup sequence succeeds.
+         *
+         * Start each chest with a clean last-check value.
+         */
+        lastCheckedLikes =
+            null;
+
+        currentLikes =
+            null;
+
+        lockedLikes =
+            null;
+
+        likesLockedForCycle =
+            false;
+
+        cycleLocked =
+            true;
+
+        checkCycleInProgress =
+            true;
+
+        likesReadThisCheck =
+            false;
+
+        likesCheckDeadline =
+            null;
+
+        openingChatSent =
+            false;
+
+        openedChestRecordedForCycle =
+            false;
+
+        soundPlayedForCycle =
+            false;
+
+        preOpenVerification = false;
+
+        chestTimerEnd =
+            null;
+
+        openingTimerEnd =
+            null;
+
+        winnerCloseAttempts =
+            0;
+
+        recoveryStartedAt =
+            Date.now();
+
+        setAction(
+            `Fresh chest cycle ${cycle} started`
+        );
+
+        setState(
+            STATES.OPENING_PANEL
+        );
+    }
+
+    /*
+     * ============================================================
+     * LOCK LIKES
+     * ============================================================
+     */
+
+    function lockLikes(
+        likes
+    ) {
+        if (
+            likesLockedForCycle
+        ) {
+            return;
+        }
+
+        /*
+         * Preserve the actual last checked number.
+         */
+        lastCheckedLikes =
+            likes;
+
+        currentLikes =
+            likes;
+
+        lockedLikes =
+            likes;
+
+        likesLockedForCycle =
+            true;
+
+        cycleLocked =
+            true;
+
+        setAction(
+            `Locked ${formatLikes(likes)} likes for cycle ${cycle}`
+        );
+    }
+
+    /*
+     * ============================================================
+     * STATE MACHINE
+     * ============================================================
+     */
+
+    async function processState() {
+
+        if (!updateBroadcastSafety()) {
+            return;
+        }
+
+        if (
+            !settings.enabled
+        ) {
+            state =
+                STATES.OFF;
+
+            return;
+        }
+
+        /*
+         * Independent Auto Info.
+         */
+        processAutoInfo();
+
+        switch (state) {
+
+            case STATES.WAITING_FOR_CHEST:
+
+                {
+                    const chestState = getChestState();
+
+                    /* Preserve existing behavior when the recheck timer is ON. */
+                    if (settings.timerEnabled) {
+                        if (getChestButton() && !cycleLocked) {
+                            beginFreshCycle();
+                        }
+                        lastObservedChestState = chestState;
+                        return;
+                    }
+
+                    /* Timer OFF: one check only when the chest becomes AVAILABLE. */
+                    if (chestState === "UNAVAILABLE") {
+                        offModeCheckedForAvailableChest = false;
+                    }
+
+                    const becameAvailable =
+                        chestState === "AVAILABLE" &&
+                        lastObservedChestState !== "AVAILABLE";
+
+                    if (
+                        chestState === "AVAILABLE" &&
+                        !offModeCheckedForAvailableChest &&
+                        (becameAvailable || lastObservedChestState === "UNKNOWN") &&
+                        !cycleLocked
+                    ) {
+                        offModeCheckedForAvailableChest = true;
+                        beginFreshCycle();
+                    }
+
+                    lastObservedChestState = chestState;
+                }
+
+                return;
+
+            case STATES.OPENING_PANEL:
+
+                /*
+                 * This state is entered ONLY when the scheduled check
+                 * timer expires. Do not run this continuously.
+                 */
+                if (!checkCycleInProgress) {
+                    return;
+                }
+
+                /*
+                 * The chest panel is opened/read while the chest is
+                 * unavailable too. The panel must remain open until the
+                 * real likes value has actually been read.
+                 */
+                if (
+                    isChestCheckPanelOpen()
+                ) {
+                    setAction(
+                        "Chest panel already open — reading likes"
+                    );
+
+                    likesCheckDeadline =
+                        Date.now() +
+                        LIVE_LIKES_CHECK_WINDOW_MS;
+
+                    setState(
+                        STATES.READING_LIKES
+                    );
+
+                    return;
+                }
+
+                if (
+                    await openChestPanel(true)
+                ) {
+                    setAction(
+                        "Treasure Chest panel opened"
+                    );
+
+                    likesCheckDeadline =
+                        Date.now() +
+                        LIVE_LIKES_CHECK_WINDOW_MS;
+
+                    setState(
+                        STATES.READING_LIKES
+                    );
+                }
+
+                return;
+
+            case STATES.READING_LIKES:
+                {
+                    if (
+                        likesLockedForCycle
+                    ) {
+                        return;
+                    }
+
+                    const likes =
+                        getChestLikes();
+
+                    if (
+                        likes === null
+                    ) {
+                        setAction(
+                            "Waiting for live chest likes"
+                        );
+
+                        return;
+                    }
+
+                    /*
+                     * getChestLikes() has already updated:
+                     *
+                     * lastCheckedLikes
+                     * currentLikes
+                     *
+                     * using the actual chest-panel value.
+                     */
+                    likesReadThisCheck =
+                        true;
+
+                    if (
+                        likes <
+                        settings.threshold
+                    ) {
+                        /*
+                         * Keep the actual chest panel open briefly while
+                         * likes are arriving. YouNow updates .total-likes
+                         * live, so the next 500 ms poll can catch the
+                         * threshold being reached during this same check.
+                         *
+                         * This is NOT the recheck timer: once this bounded
+                         * window expires, the panel closes and the normal
+                         * timer/AVAILABLE-transition rules take over.
+                         */
+                        if (!likesCheckDeadline) {
+                            likesCheckDeadline =
+                                Date.now() +
+                                LIVE_LIKES_CHECK_WINDOW_MS;
+                        }
+
+                        const remaining =
+                            Math.max(
+                                0,
+                                likesCheckDeadline -
+                                Date.now()
+                            );
+
+                        if (remaining > 0 && isChestAvailable()) {
+                            setAction(
+                                `Watching live chest likes: ${formatLikes(likes)} / ${formatLikes(settings.threshold)} — ${Math.ceil(remaining / 1000)}s left`
+                            );
+
+                            return;
+                        }
+
+                        likesCheckDeadline =
+                            null;
+
+                        setAction(
+                            `Chest likes ${formatLikes(likes)} / ${formatLikes(settings.threshold)} — check complete`
+                        );
+
+                        setState(
+                            STATES.CLOSING_BELOW_TARGET
+                        );
+
+                        return;
+                    }
+
+                    /*
+                     * The threshold may be reached while the chest is
+                     * still unavailable.  Record the real likes value,
+                     * close the panel, and wait for the next recheck.
+                     * Do not lock the cycle or send an opening message
+                     * until the chest itself is AVAILABLE.
+                     */
+                    if (!isChestAvailable()) {
+                        setAction(
+                            `Chest likes ${formatLikes(likes)} reached target, but chest is UNAVAILABLE — waiting for next check`
+                        );
+
+                        if (!likesReadThisCheck) {
+                            return;
+                        }
+
+                        const closed =
+                            await closeChestPanel();
+
+                        if (!closed) {
+                            return;
+                        }
+
+                        likesCheckDeadline =
+                            null;
+
+                        checkCycleInProgress =
+                            false;
+
+                        cycleLocked =
+                            false;
+
+                        likesLockedForCycle =
+                            false;
+
+                        lockedLikes =
+                            null;
+
+                        if (settings.timerEnabled) {
+                            startRecheckTimer();
+                            setState(STATES.WAITING_FOR_RECHECK);
+                        } else {
+                            chestTimerEnd = null;
+                            preOpenVerification = false;
+                            setState(STATES.WAITING_FOR_CHEST);
+                        }
+
+                        return;
+                    }
+
+                    likesCheckDeadline =
+                        null;
+
+                    /* Final verification: do not restart the delay or announcement. */
+                    if (preOpenVerification) {
+                        lockLikes(likes);
+                        const finalClosed = await closeChestPanel();
+                        if (!finalClosed) {
+                            setAction("Final likes check passed, but chest panel could not close yet — retrying");
+                            return;
+                        }
+                        preOpenVerification = false;
+                        checkCycleInProgress = false;
+                        setAction(`Final likes check passed: ${formatLikes(likes)} — opening now`);
+                        setState(STATES.CLICKING_CHEST);
+                        return;
+                    }
+
+                    /*
+                     * Threshold reached while the chest is AVAILABLE.
+                     */
+                    lockLikes(
+                        likes
+                    );
+
+                    /*
+                     * Opening announcement uses lastCheckedLikes.
+                     */
+                    if (
+                        settings.openingChatEnabled &&
+                        !openingChatSent
+                    ) {
+                        sendChatMessage(
+                            replaceVariables(
+                                settings.openingChatMessage
+                            )
+                        );
+
+                        openingChatSent =
+                            true;
+                    }
+
+                    /*
+                     * Close using the chest panel close control (Got it/Cancel).
+                     */
+                    const closed =
+                        await closeChestPanel();
+
+                    if (!closed) {
+                        setAction(
+                            "Chest panel could not be closed yet — retrying"
+                        );
+
+                        return;
+                    }
+
+                    startOpenDelay();
+
+                    setState(
+                        STATES.WAITING_FOR_OPEN_DELAY
+                    );
+
+                    return;
+                }
+
+            case STATES.CLOSING_BELOW_TARGET:
+                {
+                    if (
+                        isChestCheckPanelOpen()
+                    ) {
+                        const closed =
+                            await closeChestPanel();
+
+                        if (!closed) {
+                            return;
+                        }
+                    }
+
+                    checkCycleInProgress =
+                        false;
+
+                    likesReadThisCheck =
+                        false;
+
+                    likesCheckDeadline =
+                        null;
+
+                    cycleLocked =
+                        false;
+
+                    preOpenVerification = false;
+
+                    likesLockedForCycle =
+                        false;
+
+                    lockedLikes =
+                        null;
+
+                    /*
+                     * Keep lastCheckedLikes so {likes} continues to
+                     * represent the last actual chest check until
+                     * the next fresh cycle starts.
+                     */
+
+                    if (settings.timerEnabled) {
+                        startRecheckTimer();
+                        setState(STATES.WAITING_FOR_RECHECK);
+                    } else {
+                        /* No timer: wait for the next AVAILABLE transition. */
+                        chestTimerEnd = null;
+                        setState(STATES.WAITING_FOR_CHEST);
+                    }
+
+                    return;
+                }
+
+            case STATES.WAITING_FOR_RECHECK:
+
+                /*
+                 * NEVER close/open the chest panel here. The panel is
+                 * handled only by the active timer-driven check cycle.
+                 */
+                if (
+                    checkCycleInProgress
+                ) {
+                    return;
+                }
+
+                if (
+                    chestTimerEnd &&
+                    Date.now() >=
+                        chestTimerEnd
+                ) {
+                    chestTimerEnd =
+                        null;
+
+                    /*
+                     * New cycle begins with a clean lastCheckedLikes.
+                     */
+                    lastCheckedLikes =
+                        null;
+
+                    currentLikes =
+                        null;
+
+                    lockedLikes =
+                        null;
+
+                    likesLockedForCycle =
+                        false;
+
+                    cycleLocked =
+                        true;
+
+                    checkCycleInProgress =
+                        true;
+
+                    likesReadThisCheck =
+                        false;
+
+                    setAction(
+                        "Recheck timer expired — checking chest again"
+                    );
+
+                    setState(
+                        STATES.OPENING_PANEL
+                    );
+                }
+
+                return;
+
+            case STATES.WAITING_FOR_OPEN_DELAY:
+
+                if (
+                    isChestModalOpen()
+                ) {
+                    await closeTreasureChestModal();
+
+                    return;
+                }
+
+                if (
+                    openingTimerEnd &&
+                    Date.now() >=
+                        openingTimerEnd
+                ) {
+                    openingTimerEnd = null;
+
+                    /* Timer OFF: one final live likes check immediately before opening. */
+                    if (!settings.timerEnabled && !preOpenVerification) {
+                        preOpenVerification = true;
+                        checkCycleInProgress = true;
+                        likesReadThisCheck = false;
+                        likesCheckDeadline = null;
+                        /* Unlock the previous value so this is a real fresh read. */
+                        likesLockedForCycle = false;
+                        lockedLikes = null;
+                        lastCheckedLikes = null;
+                        currentLikes = null;
+                        setAction("Opening delay complete — final chest likes check before opening");
+                        setState(STATES.OPENING_PANEL);
+                        return;
+                    }
+
+                    setAction("Opening delay complete");
+                    setState(STATES.CLICKING_CHEST);
+                }
+
+                return;
+
+            case STATES.CLICKING_CHEST:
+
+                if (
+                    isChestModalOpen()
+                ) {
+                    await closeTreasureChestModal();
+
+                    return;
+                }
+
+                if (
+                    !cycleLocked ||
+                    !likesLockedForCycle
+                ) {
+                    setState(
+                        STATES.WAITING_FOR_CHEST
+                    );
+
+                    return;
+                }
+
+                if (
+                    settings.openingChatEnabled &&
+                    !openingChatSent
+                ) {
+                    sendOpeningAnnouncement();
+                }
+
+                const chestButton =
+                    getChestButton();
+
+                if (
+                    !chestButton ||
+                    !isVisible(
+                        chestButton
+                    )
+                ) {
+                    return;
+                }
+
+                try {
+                    chestButton.click();
+
+                    setAction(
+                        `Actual chest clicked — locked likes ${formatLikes(lockedLikes)}`
+                    );
+
+                    setState(
+                        STATES.CLICKING_OPEN
+                    );
+                } catch (error) {
+                    console.warn(
+                        "[Chest Helper] Actual chest click failed:",
+                        error
+                    );
+                }
+
+                return;
+
+            case STATES.CLICKING_OPEN:
+
+                /* Never reread likes here. Play the optional custom
+                 * sound immediately before the real Open click. */
+                if (
+                    !soundPlayedForCycle &&
+                    settings.openSoundEnabled
+                ) {
+                    await playCustomOpenSound();
+                    soundPlayedForCycle = true;
+                }
+
+                if (
+                    clickChestOpenButton()
+                ) {
+                    setState(
+                        STATES.WAITING_FOR_RAIN
+                    );
+
+                    return;
+                }
+
+                if (
+                    Date.now() -
+                        stateStartedAt >
+                    15000
+                ) {
+                    setAction(
+                        "Open button timeout — continuing recovery"
+                    );
+
+                    setState(
+                        STATES.WAITING_FOR_RAIN
+                    );
+                }
+
+                return;
+
+            case STATES.WAITING_FOR_RAIN:
+
+                if (
+                    clickMakeItRain()
+                ) {
+                    setState(
+                        STATES.WAITING_FOR_TELL_THEM
+                    );
+
+                    return;
+                }
+
+                if (
+                    Date.now() -
+                        stateStartedAt >
+                    15000
+                ) {
+                    setAction(
+                        "Make It Rain timeout — continuing"
+                    );
+
+                    setState(
+                        STATES.WAITING_FOR_TELL_THEM
+                    );
+                }
+
+                return;
+
+            case STATES.WAITING_FOR_TELL_THEM:
+
+                if (
+                    clickTellThem()
+                ) {
+                    await sleep(
+                        500
+                    );
+
+                    setState(
+                        STATES.WAITING_FOR_CHEST_RESET
+                    );
+
+                    return;
+                }
+
+                if (
+                    Date.now() -
+                        stateStartedAt >
+                    8000
+                ) {
+                    setAction(
+                        "Tell Them timeout — waiting for chest reset"
+                    );
+
+                    setState(
+                        STATES.WAITING_FOR_CHEST_RESET
+                    );
+                }
+
+                return;
+
+            case STATES.WAITING_FOR_CHEST_RESET:
+
+                /*
+                 * Do not reread likes.
+                 */
+                if (
+                    getChestState() ===
+                    "UNAVAILABLE"
+                ) {
+                    setAction(
+                        "Chest reset detected"
+                    );
+
+                    setState(
+                        STATES.WAITING_FOR_WINNERS
+                    );
+
+                    return;
+                }
+
+                if (
+                    findWinnersPanel()
+                ) {
+                    setState(
+                        STATES.CLOSING_WINNERS
+                    );
+
+                    return;
+                }
+
+                if (
+                    Date.now() -
+                        stateStartedAt >
+                    15000
+                ) {
+                    setAction(
+                        "Chest reset timeout — checking Winners"
+                    );
+
+                    setState(
+                        STATES.WAITING_FOR_WINNERS
+                    );
+                }
+
+                return;
+
+            case STATES.WAITING_FOR_WINNERS:
+                {
+                    const winners =
+                        findWinnersPanel();
+
+                    if (winners) {
+                        winnerCloseAttempts =
+                            0;
+
+                        setState(
+                            STATES.CLOSING_WINNERS
+                        );
+
+                        return;
+                    }
+
+                    if (
+                        Date.now() -
+                            stateStartedAt >
+                        12000
+                    ) {
+                        setAction(
+                            "No Winners panel detected — cleanup"
+                        );
+
+                        setState(
+                            STATES.CLEANUP
+                        );
+                    }
+
+                    return;
+                }
+
+            case STATES.CLOSING_WINNERS:
+
+                if (
+                    await closeWinnersPanel()
+                ) {
+                    setState(
+                        STATES.CLEANUP
+                    );
+                }
+
+                return;
+
+            case STATES.CLEANUP:
+
+                if (
+                    isChestModalOpen()
+                ) {
+                    const closed =
+                        await closeTreasureChestModal();
+
+                    if (!closed) {
+                        return;
+                    }
+                }
+
+                if (
+                    findWinnersPanel()
+                ) {
+                    const closed =
+                        await closeWinnersPanel();
+
+                    if (!closed) {
+                        return;
+                    }
+                }
+
+                /*
+                 * At this point the chest panel and Winners panel are
+                 * both confirmed closed, so this is a completed chest.
+                 * Record it once, before clearing the cycle values.
+                 */
+                completeChestCycle();
+                addOpenedChestLog();
+                renderChestLog();
+
+                openedChestRecordedForCycle =
+                    false;
+
+                currentLikes =
+                    null;
+
+                lockedLikes =
+                    null;
+
+                likesLockedForCycle =
+                    false;
+
+                cycleLocked =
+                    false;
+
+                preOpenVerification = false;
+
+                openingChatSent =
+                    false;
+
+                chestTimerEnd =
+                    null;
+
+                openingTimerEnd =
+                    null;
+
+                winnerCloseAttempts =
+                    0;
+
+                /*
+                 * Preserve lastCheckedLikes until the next fresh
+                 * cycle. This makes it possible to see the last
+                 * actual chest value in the helper/footer.
+                 */
+
+                recoveryStartedAt =
+                    Date.now();
+
+                /*
+                 * Recheck Timer OFF: after a chest has finished opening,
+                 * immediately establish the next chest availability check.
+                 *
+                 * If YouNow has already reset the chest and it is AVAILABLE
+                 * right now, seed the OFF-mode edge detector as if the chest
+                 * had just been UNAVAILABLE. The next 500 ms poll will then
+                 * perform exactly one fresh likes check.
+                 *
+                 * If it is still UNAVAILABLE, leave the detector at
+                 * UNAVAILABLE so the next real AVAILABLE transition will
+                 * trigger the next check. No timer is created.
+                 */
+                const postOpenChestState =
+                    getChestState();
+
+                if (!settings.timerEnabled) {
+                    chestTimerEnd = null;
+                    offModeCheckedForAvailableChest = false;
+
+                    if (postOpenChestState === "AVAILABLE") {
+                        lastObservedChestState = "UNAVAILABLE";
+                        setAction(
+                            `Cycle ${cycle} complete — chest already AVAILABLE; checking again now`
+                        );
+                    } else {
+                        lastObservedChestState =
+                            postOpenChestState === "UNAVAILABLE"
+                                ? "UNAVAILABLE"
+                                : "UNKNOWN";
+
+                        setAction(
+                            `Cycle ${cycle} complete — waiting for chest to become AVAILABLE`
+                        );
+                    }
+                } else {
+                    setAction(
+                        `Cycle ${cycle} complete — waiting for next chest`
+                    );
+                }
+
+                setState(
+                    STATES.WAITING_FOR_CHEST
+                );
+
+                return;
+
+            case STATES.OFF:
+            default:
+                return;
+        }
+    }
+
+    /*
+     * ============================================================
+     * RECOVERY
+     * ============================================================
+     */
+
+    function recovery() {
+
+        if (
+            !settings.enabled
+        ) {
+            return;
+        }
+
+        if (
+            state ===
+                STATES.READING_LIKES ||
+            state ===
+                STATES.CLOSING_BELOW_TARGET ||
+            state ===
+                STATES.CLICKING_CHEST ||
+            state ===
+                STATES.CLICKING_OPEN ||
+            state ===
+                STATES.WAITING_FOR_RAIN ||
+            state ===
+                STATES.WAITING_FOR_TELL_THEM
+        ) {
+            return;
+        }
+
+        /*
+         * The Open/Cancel Treasure Chest modal is separate from the
+         * sidebar check panel. Only Cancel is used here.
+         */
+        if (
+            isChestModalOpen() &&
+            (
+                state ===
+                    STATES.WAITING_FOR_OPEN_DELAY ||
+                state ===
+                    STATES.CLEANUP
+            )
+        ) {
+            closeTreasureChestModal();
+
+            return;
+        }
+
+        if (
+            Date.now() -
+                recoveryStartedAt >
+            120000
+        ) {
+            currentLikes =
+                null;
+
+            lockedLikes =
+                null;
+
+            likesLockedForCycle =
+                false;
+
+            cycleLocked =
+                false;
+
+            openingChatSent =
+                false;
+
+            openedChestRecordedForCycle =
+                false;
+
+            chestTimerEnd =
+                null;
+
+            openingTimerEnd =
+                null;
+
+            winnerCloseAttempts =
+                0;
+
+            recoveryStartedAt =
+                Date.now();
+
+            setAction(
+                "Recovery reset — waiting for next chest"
+            );
+
+            setState(
+                STATES.WAITING_FOR_CHEST
+            );
+        }
+    }
+
+    /*
+     * ============================================================
+     * CSS
+     * ============================================================
+     */
+
+    function installCSS() {
+        const css = `
+            #younow-chest-helper-v946 {
+                position:fixed;
+                top:90px;
+                right:20px;
+                width:400px;
+                max-width:calc(100vw - 30px);
+                max-height:calc(100vh - 30px);
+                z-index:2147483646;
+                background:#171717;
+                color:#f2f2f2;
+                border:1px solid #444;
+                border-radius:10px;
+                box-shadow:0 8px 30px rgba(0,0,0,.45);
+                font-family:Arial,Helvetica,sans-serif;
+                font-size:13px;
+                overflow:hidden;
+            }
+
+            #younow-chest-helper-v946 .ych-header {
+                display:flex;
+                align-items:center;
+                justify-content:space-between;
+                padding:9px 10px;
+                background:#222;
+                border-bottom:1px solid #444;
+                cursor:move;
+                user-select:none;
+            }
+
+            #younow-chest-helper-v946 .ych-title {
+                display:flex;
+                align-items:center;
+                gap:7px;
+                font-weight:700;
+            }
+
+            #younow-chest-helper-v946 .ych-version {
+                color:#999;
+                font-size:11px;
+                font-weight:400;
+            }
+
+            #younow-chest-helper-v946 .ych-header-buttons {
+                display:flex;
+                gap:4px;
+            }
+
+            #younow-chest-helper-v946 .ych-head-btn {
+                width:27px;
+                height:25px;
+                border:1px solid #555;
+                border-radius:5px;
+                background:#333;
+                color:#fff;
+                cursor:pointer;
+            }
+
+            #younow-chest-helper-v946 .ych-body {
+                padding:10px;
+                overflow-y:auto;
+                max-height:calc(100vh - 110px);
+            }
+
+            #younow-chest-helper-v946.ych-minimized .ych-body {
+                display:none;
+            }
+
+            #younow-chest-helper-v946.ych-maximized {
+                width:min(540px,calc(100vw - 20px));
+                max-width:calc(100vw - 20px);
+                max-height:calc(100vh - 20px);
+                top:10px;
+                right:10px;
+            }
+
+            #younow-chest-helper-v946.ych-maximized .ych-body {
+                max-height:calc(100vh - 75px);
+            }
+
+            #younow-chest-helper-v946 .ych-section {
+                margin-bottom:10px;
+                padding:9px;
+                background:#202020;
+                border:1px solid #363636;
+                border-radius:7px;
+            }
+
+            #younow-chest-helper-v946 .ych-section-title {
+                margin-bottom:7px;
+                color:#aaa;
+                font-size:11px;
+                font-weight:700;
+                text-transform:uppercase;
+                letter-spacing:.5px;
+            }
+
+            #younow-chest-helper-v946 .ych-row {
+                display:grid;
+                grid-template-columns:42% 58%;
+                gap:5px;
+                padding:3px 0;
+                align-items:start;
+            }
+
+            #younow-chest-helper-v946 .ych-row span {
+                color:#aaa;
+            }
+
+            #younow-chest-helper-v946 .ych-row strong {
+                min-width:0;
+                overflow-wrap:anywhere;
+                color:#fff;
+            }
+
+            #younow-chest-helper-v946 .ych-field {
+                display:block;
+                margin-bottom:8px;
+                color:#ccc;
+                font-size:12px;
+            }
+
+            #younow-chest-helper-v946 input[type="number"],
+            #younow-chest-helper-v946 textarea {
+                box-sizing:border-box;
+                width:100%;
+                margin-top:4px;
+                padding:6px;
+                background:#111;
+                color:#fff;
+                border:1px solid #555;
+                border-radius:5px;
+                font-family:inherit;
+                font-size:12px;
+            }
+
+            #younow-chest-helper-v946 textarea {
+                resize:vertical;
+            }
+
+            #younow-chest-helper-v946 .ych-check {
+                display:flex;
+                gap:7px;
+                align-items:center;
+                margin:7px 0;
+                color:#ccc;
+                cursor:pointer;
+            }
+
+            #younow-chest-helper-v946 .ych-check input {
+                margin:0;
+            }
+
+            #younow-chest-helper-v946 .ych-buttons {
+                display:grid;
+                grid-template-columns:90px 1fr;
+                gap:7px;
+                margin-bottom:10px;
+            }
+
+            #younow-chest-helper-v946 .ych-buttons button {
+                min-height:34px;
+                border:1px solid #555;
+                border-radius:6px;
+                background:#333;
+                color:#fff;
+                font-weight:700;
+                cursor:pointer;
+            }
+
+            #younow-chest-helper-v946 .ych-off {
+                background:#4b2222 !important;
+            }
+
+            /*
+             * Restored footer.
+             */
+            #younow-chest-helper-v946 .ych-footer {
+                padding:8px 10px;
+                background:#151515;
+                border-top:1px solid #3b3b3b;
+                color:#888;
+                font-size:10px;
+                line-height:1.5;
+                text-align:center;
+            }
+
+            #younow-chest-helper-v946 .ych-footer strong {
+                color:#aaa;
+            }
+
+            #younow-chest-helper-v946 .ych-sound-section {
+                margin-top:10px;
+                padding-top:10px;
+                border-top:1px solid rgba(255,255,255,0.08);
+            }
+
+            #younow-chest-helper-v946 .ych-sound-name {
+                margin-top:6px;
+                font-size:12px;
+                opacity:0.85;
+                overflow:hidden;
+                text-overflow:ellipsis;
+                white-space:nowrap;
+            }
+
+            #younow-chest-helper-v946 .ych-sound-buttons {
+                display:flex;
+                flex-wrap:wrap;
+                gap:6px;
+                margin-top:7px;
+            }
+
+            #younow-chest-helper-v946 .ych-log-wrap {
+                display:flex;
+                align-items:center;
+                justify-content:space-between;
+                gap:8px;
+                margin-bottom:7px;
+            }
+
+            #younow-chest-helper-v946 .ych-log-count {
+                color:#888;
+                font-size:10px;
+            }
+
+            #younow-chest-helper-v946 .ych-log-reset {
+                min-height:25px;
+                padding:3px 8px;
+                border:1px solid #555;
+                border-radius:5px;
+                background:#333;
+                color:#fff;
+                font-size:11px;
+                font-weight:700;
+                cursor:pointer;
+            }
+
+            #younow-chest-helper-v946 .ych-log {
+                max-height:220px;
+                overflow-y:auto;
+                padding-right:4px;
+                border:1px solid #333;
+                border-radius:5px;
+                background:#111;
+            }
+
+            #younow-chest-helper-v946 .ych-log-entry {
+                padding:7px;
+                border-bottom:1px solid #2f2f2f;
+            }
+
+            #younow-chest-helper-v946 .ych-log-entry:last-child {
+                border-bottom:0;
+            }
+
+            #younow-chest-helper-v946 .ych-log-top {
+                display:flex;
+                justify-content:space-between;
+                gap:8px;
+                color:#ddd;
+            }
+
+            #younow-chest-helper-v946 .ych-log-top span {
+                color:#8fd18f;
+                font-size:10px;
+                font-weight:700;
+            }
+
+            #younow-chest-helper-v946 .ych-log-time {
+                margin-top:2px;
+                color:#777;
+                font-size:10px;
+            }
+
+            #younow-chest-helper-v946 .ych-log-details {
+                display:flex;
+                flex-wrap:wrap;
+                gap:5px 10px;
+                margin-top:4px;
+                color:#999;
+                font-size:10px;
+            }
+
+            #younow-chest-helper-v946 .ych-log-details b {
+                color:#ddd;
+            }
+
+            #younow-chest-helper-v946 .ych-log-empty {
+                padding:12px 8px;
+                color:#777;
+                text-align:center;
+                font-size:11px;
+            }
+
+            #younow-chest-helper-v946 .ych-help {
+                padding:7px;
+                background:#111;
+                border-radius:5px;
+                color:#999;
+                font-size:10px;
+                line-height:1.5;
+            }
+        `;
+
+        try {
+            GM_addStyle(css);
+        } catch (_) {
+            const style =
+                document.createElement(
+                    "style"
+                );
+
+            style.textContent =
+                css;
+
+            document.head.appendChild(
+                style
+            );
+        }
+    }
+
+    /*
+     * ============================================================
+     * CREATE HELPER PANEL
+     * ============================================================
+     */
+
+    function createHelperPanel() {
+
+        if (
+            document.getElementById(
+                "younow-chest-helper-v946"
+            )
+        ) {
+            helperPanel =
+                document.getElementById(
+                    "younow-chest-helper-v946"
+                );
+
+            return;
+        }
+
+        helperPanel =
+            document.createElement(
+                "div"
+            );
+
+        helperPanel.id =
+            "younow-chest-helper-v946";
+
+        helperPanel.innerHTML = `
+            <div class="ych-header">
+
+                <div class="ych-title">
+                    <span>YouNow Auto Chest Helper</span>
+                    <span class="ych-version">
+                        v${VERSION}
+                    </span>
+                </div>
+
+                <div class="ych-header-buttons">
+
+                    <button
+                        type="button"
+                        class="ych-head-btn"
+                        data-action="minimize"
+                    >−</button>
+
+                    <button
+                        type="button"
+                        class="ych-head-btn"
+                        data-action="maximize"
+                    >□</button>
+
+                </div>
+
+            </div>
+
+            <div class="ych-body">
+
+                <div class="ych-section">
+
+                    <div class="ych-row">
+                        <span>Status</span>
+                        <strong data-field="status">—</strong>
+                    </div>
+
+                    <div class="ych-row">
+                        <span>State</span>
+                        <strong data-field="state">—</strong>
+                    </div>
+
+                    <div class="ych-row">
+                        <span>Cycle</span>
+                        <strong data-field="cycle">—</strong>
+                    </div>
+
+                    <div class="ych-row">
+                        <span>Last Action</span>
+                        <strong data-field="action">—</strong>
+                    </div>
+
+                </div>
+
+                <div class="ych-section">
+
+                    <div class="ych-section-title">
+                        Chest
+                    </div>
+
+                    <div class="ych-row">
+                        <span>Chest State</span>
+                        <strong data-field="chest">—</strong>
+                    </div>
+
+                    <div class="ych-row">
+                        <span>Last Chest Check</span>
+                        <strong data-field="last-check">—</strong>
+                    </div>
+
+                    <div class="ych-row">
+                        <span>Current Likes</span>
+                        <strong data-field="likes">—</strong>
+                    </div>
+
+                    <div class="ych-row">
+                        <span>Target</span>
+                        <strong data-field="target">—</strong>
+                    </div>
+
+                    <div class="ych-row">
+                        <span>Locked Likes</span>
+                        <strong data-field="locked">—</strong>
+                    </div>
+
+                </div>
+
+                <div class="ych-section">
+
+                    <div class="ych-section-title">
+                        Timers
+                    </div>
+
+                    <div class="ych-row">
+                        <span>Recheck</span>
+                        <strong data-field="recheck">—</strong>
+                    </div>
+
+                    <div class="ych-row">
+                        <span>Opening Delay</span>
+                        <strong data-field="opening">—</strong>
+                    </div>
+
+                    <div class="ych-row">
+                        <span>Auto Info</span>
+                        <strong data-field="auto-info">—</strong>
+                    </div>
+
+                </div>
+
+                <div class="ych-section">
+
+                    <div class="ych-section-title">
+                        Variables
+                    </div>
+
+                    <label class="ych-field">
+                        Threshold Likes
+                        <input
+                            type="number"
+                            min="500"
+                            step="1"
+                            data-setting="threshold"
+                        >
+                    </label>
+
+                    <label class="ych-field">
+                        Recheck Seconds
+                        <input
+                            type="number"
+                            min="1"
+                            step="1"
+                            data-setting="recheckSeconds"
+                        >
+                    </label>
+
+                    <label class="ych-field">
+                        Opening Delay Seconds
+                        <input
+                            type="number"
+                            min="0"
+                            step="1"
+                            data-setting="openingDelaySeconds"
+                        >
+                    </label>
+
+                    <label class="ych-field">
+                        Auto Info Minutes
+                        <input
+                            type="number"
+                            min="1"
+                            step="1"
+                            data-setting="autoInfoMinutes"
+                        >
+                    </label>
+
+                    <label class="ych-field">
+                        Opening Chat Message
+                        <textarea
+                            rows="3"
+                            data-setting="openingChatMessage"
+                        ></textarea>
+                    </label>
+
+                    <div class="ych-sound-section">
+                        <div class="ych-section-title">Chest Open Sound</div>
+                        <label class="ych-check">
+                            <input type="checkbox" data-setting="openSoundEnabled">
+                            Play custom sound just before chest opens
+                        </label>
+                        <div class="ych-sound-name" data-field="open-sound-name">No sound selected</div>
+                        <div class="ych-sound-buttons">
+                            <button type="button" data-action="select-open-sound">SELECT SOUND</button>
+                            <button type="button" data-action="test-open-sound">TEST SOUND</button>
+                            <button type="button" data-action="clear-open-sound">CLEAR</button>
+                        </div>
+                        <label class="ych-field">
+                            Sound Volume
+                            <input type="range" min="0" max="100" step="1" data-setting="openSoundVolume">
+                            <span data-field="open-sound-volume">80%</span>
+                        </label>
+                        <input type="file" accept="audio/*" data-action="open-sound-file" style="display:none;">
+                    </div>
+
+                    <label class="ych-field">
+                        Auto Info Message
+                        <textarea
+                            rows="3"
+                            data-setting="autoInfoMessage"
+                        ></textarea>
+                    </label>
+
+                    <label class="ych-check">
+                        <input
+                            type="checkbox"
+                            data-setting="timerEnabled"
+                        >
+                        Chest Recheck Timer ON
+                    </label>
+
+                    <label class="ych-check">
+                        <input
+                            type="checkbox"
+                            data-setting="openingChatEnabled"
+                        >
+                        Opening Chat ON
+                    </label>
+
+                    <label class="ych-check">
+                        <input
+                            type="checkbox"
+                            data-setting="autoInfoEnabled"
+                        >
+                        Auto Chest Information ON
+                    </label>
+
+                </div>
+
+                <div class="ych-section">
+
+                    <div class="ych-log-wrap">
+                        <div class="ych-section-title" style="margin:0;">
+                            Opened Chests
+                            <span class="ych-log-count" data-field="chest-log-count">0</span>
+                        </div>
+
+                        <button
+                            type="button"
+                            class="ych-log-reset"
+                            data-action="reset-log"
+                        >RESET LOG</button>
+                    </div>
+
+                    <div
+                        class="ych-log"
+                        data-field="chest-log"
+                    ></div>
+
+                </div>
+
+                <div class="ych-buttons">
+
+                    <button
+                        type="button"
+                        data-action="toggle"
+                    >ON</button>
+
+                    <button
+                        type="button"
+                        data-action="save"
+                    >SAVE SETTINGS</button>
+
+                </div>
+
+                <div class="ych-help">
+
+                    <b>Chat variables</b><br>
+                    {likes} = last actual chest likes check<br>
+                    {threshold} = configured target<br>
+                    {lockedLikes} = likes locked for opening<br>
+                    {delay} = opening delay<br>
+                    {cycle} = cycle number<br>
+                    {remaining} = active timer remaining
+
+                </div>
+
+            </div>
+
+            <div class="ych-footer">
+                <strong>Made for Lolitskayyla by Cenastor</strong>
+                &nbsp;•&nbsp;
+                v${VERSION}
+                &nbsp;•&nbsp;
+                Last Chest Check:
+                <span data-field="footer-likes">—</span>
+            </div>
+        `;
+
+        document.body.appendChild(
+            helperPanel
+        );
+
+        applyPanelSettings();
+
+        applyPanelPosition();
+
+        applyPanelState();
+
+        attachPanelEvents();
+
+        renderChestLog();
+        updateUI();
+    }
+
+    /*
+     * ============================================================
+     * PANEL SETTINGS
+     * ============================================================
+     */
+
+    function applyPanelSettings() {
+        if (!helperPanel) {
+            return;
+        }
+
+        helperPanel.querySelectorAll(
+            "[data-setting]"
+        ).forEach(
+            element => {
+                const key =
+                    element.dataset.setting;
+
+                if (
+                    element.type ===
+                    "checkbox"
+                ) {
+                    element.checked =
+                        !!settings[key];
+                } else if (
+                    key === "openSoundVolume"
+                ) {
+                    element.value =
+                        Math.round(
+                            clamp(
+                                Number(settings[key]),
+                                0,
+                                1
+                            ) * 100
+                        );
+                } else {
+                    element.value =
+                        settings[key] ??
+                        "";
+                }
+            }
+        );
+
+        const toggle =
+            helperPanel.querySelector(
+                '[data-action="toggle"]'
+            );
+
+        if (toggle) {
+            toggle.textContent =
+                settings.enabled
+                    ? "ON"
+                    : "OFF";
+
+            toggle.classList.toggle(
+                "ych-off",
+                !settings.enabled
+            );
+        }
+    }
+
+    function savePanelSettings() {
+        if (!helperPanel) {
+            return;
+        }
+
+        helperPanel.querySelectorAll(
+            "[data-setting]"
+        ).forEach(
+            element => {
+                const key =
+                    element.dataset.setting;
+
+                if (
+                    element.type ===
+                    "checkbox"
+                ) {
+                    settings[key] =
+                        element.checked;
+                } else if (
+                    key === "openSoundVolume"
+                ) {
+                    settings[key] =
+                        clamp(
+                            Number(element.value) / 100,
+                            0,
+                            1
+                        );
+                } else {
+                    settings[key] =
+                        element.value;
+                }
+            }
+        );
+
+        settings.threshold =
+            clampThreshold(
+                settings.threshold
+            );
+
+        settings.recheckSeconds =
+            Math.max(
+                1,
+                parseInt(
+                    settings.recheckSeconds,
+                    10
+                ) || 1
+            );
+
+        settings.openingDelaySeconds =
+            Math.max(
+                0,
+                parseInt(
+                    settings.openingDelaySeconds,
+                    10
+                ) || 0
+            );
+
+        settings.autoInfoMinutes =
+            Math.max(
+                1,
+                parseInt(
+                    settings.autoInfoMinutes,
+                    10
+                ) || 1
+            );
+
+        saveSettings();
+
+        if (!settings.timerEnabled) {
+            chestTimerEnd = null;
+            /* Switching the timer OFF starts a new AVAILABLE-edge check, not a timer. */
+            lastObservedChestState = "UNKNOWN";
+            offModeCheckedForAvailableChest = false;
+        }
+
+        scheduleAutoInfo();
+
+        setAction(
+            "Settings saved"
+        );
+
+        applyPanelSettings();
+    }
+
+    function toggleEnabled() {
+        if (!settings.enabled && !detectOwnBroadcasting()) {
+            setAction("Cannot turn automation ON — END button not found");
+            return;
+        }
+
+        settings.enabled =
+            !settings.enabled;
+
+        saveSettings();
+
+        if (
+            !settings.enabled
+        ) {
+            state =
+                STATES.OFF;
+
+            cycleLocked =
+                false;
+
+            likesLockedForCycle =
+                false;
+
+            chestTimerEnd =
+                null;
+
+            openingTimerEnd =
+                null;
+            autoInfoNextAt = null;
+            preOpenVerification = false;
+            offModeCheckedForAvailableChest = false;
+
+            setAction(
+                "Helper turned OFF"
+            );
+        } else {
+            currentLikes =
+                null;
+
+            lockedLikes =
+                null;
+
+            likesLockedForCycle =
+                false;
+
+            cycleLocked =
+                false;
+
+            openingChatSent =
+                false;
+
+            openedChestRecordedForCycle =
+                false;
+
+            soundPlayedForCycle =
+                false;
+
+            state =
+                STATES.WAITING_FOR_CHEST;
+
+            recoveryStartedAt =
+                Date.now();
+
+            setAction(
+                "Helper turned ON"
+            );
+        }
+
+        applyPanelSettings();
+    }
+
+    /*
+     * ============================================================
+     * PANEL DRAGGING
+     * ============================================================
+     */
+
+    function clampPosition(
+        x,
+        y
+    ) {
+        if (!helperPanel) {
+            return {
+                x,
+                y
+            };
+        }
+
+        const rect =
+            helperPanel.getBoundingClientRect();
+
+        return {
+            x: Math.min(
+                Math.max(
+                    0,
+                    x
+                ),
+                Math.max(
+                    0,
+                    window.innerWidth -
+                        rect.width
+                )
+            ),
+
+            y: Math.min(
+                Math.max(
+                    0,
+                    y
+                ),
+                Math.max(
+                    0,
+                    window.innerHeight -
+                        rect.height
+                )
+            )
+        };
+    }
+
+    function applyPanelPosition() {
+        if (!helperPanel) {
+            return;
+        }
+
+        if (
+            Number.isFinite(
+                Number(
+                    settings.panelX
+                )
+            ) &&
+            Number.isFinite(
+                Number(
+                    settings.panelY
+                )
+            )
+        ) {
+            const position =
+                clampPosition(
+                    Number(
+                        settings.panelX
+                    ),
+                    Number(
+                        settings.panelY
+                    )
+                );
+
+            helperPanel.style.left =
+                `${position.x}px`;
+
+            helperPanel.style.top =
+                `${position.y}px`;
+
+            helperPanel.style.right =
+                "auto";
+        }
+    }
+
+    function beginDrag(
+        event
+    ) {
+        if (
+            event.button !== 0 ||
+            !helperPanel
+        ) {
+            return;
+        }
+
+        if (
+            event.target.closest(
+                "button,input,textarea,select"
+            )
+        ) {
+            return;
+        }
+
+        const rect =
+            helperPanel.getBoundingClientRect();
+
+        dragState.active =
+            true;
+
+        dragState.offsetX =
+            event.clientX -
+            rect.left;
+
+        dragState.offsetY =
+            event.clientY -
+            rect.top;
+
+        helperPanel.style.left =
+            `${rect.left}px`;
+
+        helperPanel.style.top =
+            `${rect.top}px`;
+
+        helperPanel.style.right =
+            "auto";
+
+        event.preventDefault();
+    }
+
+    function dragPanel(
+        event
+    ) {
+        if (
+            !dragState.active ||
+            !helperPanel
+        ) {
+            return;
+        }
+
+        const position =
+            clampPosition(
+                event.clientX -
+                    dragState.offsetX,
+
+                event.clientY -
+                    dragState.offsetY
+            );
+
+        helperPanel.style.left =
+            `${position.x}px`;
+
+        helperPanel.style.top =
+            `${position.y}px`;
+    }
+
+    function endDrag() {
+        if (
+            !dragState.active ||
+            !helperPanel
+        ) {
+            return;
+        }
+
+        dragState.active =
+            false;
+
+        const rect =
+            helperPanel.getBoundingClientRect();
+
+        const position =
+            clampPosition(
+                rect.left,
+                rect.top
+            );
+
+        settings.panelX =
+            position.x;
+
+        settings.panelY =
+            position.y;
+
+        saveSettings();
+    }
+
+    function toggleMinimize() {
+        settings.minimized =
+            !settings.minimized;
+
+        if (
+            settings.minimized
+        ) {
+            settings.maximized =
+                false;
+        }
+
+        saveSettings();
+
+        applyPanelState();
+    }
+
+    function toggleMaximize() {
+        settings.maximized =
+            !settings.maximized;
+
+        if (
+            settings.maximized
+        ) {
+            settings.minimized =
+                false;
+        }
+
+        saveSettings();
+
+        applyPanelState();
+    }
+
+    function applyPanelState() {
+        if (!helperPanel) {
+            return;
+        }
+
+        helperPanel.classList.toggle(
+            "ych-minimized",
+            !!settings.minimized
+        );
+
+        helperPanel.classList.toggle(
+            "ych-maximized",
+            !!settings.maximized
+        );
+    }
+
+    function attachPanelEvents() {
+        if (!helperPanel) {
+            return;
+        }
+
+        helperPanel.querySelector(
+            ".ych-header"
+        )?.addEventListener(
+            "pointerdown",
+            beginDrag
+        );
+
+        helperPanel.querySelector(
+            '[data-action="toggle"]'
+        )?.addEventListener(
+            "click",
+            toggleEnabled
+        );
+
+        helperPanel.querySelector(
+            '[data-action="save"]'
+        )?.addEventListener(
+            "click",
+            savePanelSettings
+        );
+
+        helperPanel.querySelector(
+            '[data-action="select-open-sound"]'
+        )?.addEventListener(
+            "click",
+            () => helperPanel.querySelector(
+                '[data-action="open-sound-file"]'
+            )?.click()
+        );
+
+        helperPanel.querySelector(
+            '[data-action="open-sound-file"]'
+        )?.addEventListener(
+            "change",
+            handleOpenSoundFile
+        );
+
+        helperPanel.querySelector(
+            '[data-action="test-open-sound"]'
+        )?.addEventListener(
+            "click",
+            testOpenSound
+        );
+
+        helperPanel.querySelector(
+            '[data-action="clear-open-sound"]'
+        )?.addEventListener(
+            "click",
+            clearCustomOpenSound
+        );
+
+        helperPanel.querySelector(
+            '[data-setting="openSoundVolume"]'
+        )?.addEventListener(
+            "input",
+            event => {
+                settings.openSoundVolume =
+                    clamp(
+                        Number(event.target.value) / 100,
+                        0,
+                        1
+                    );
+
+                if (soundAudio) {
+                    soundAudio.volume =
+                        settings.openSoundVolume;
+                }
+
+                saveSettings();
+                updateUI();
+            }
+        );
+
+
+        helperPanel.querySelector(
+            '[data-action="reset-log"]'
+        )?.addEventListener(
+            "click",
+            () => {
+                if (
+                    window.confirm(
+                        "Reset the opened chest history? This will not change your settings or automation."
+                    )
+                ) {
+                    resetChestLog();
+                }
+            }
+        );
+
+        helperPanel.querySelector(
+            '[data-action="minimize"]'
+        )?.addEventListener(
+            "click",
+            toggleMinimize
+        );
+
+        helperPanel.querySelector(
+            '[data-action="maximize"]'
+        )?.addEventListener(
+            "click",
+            toggleMaximize
+        );
+
+        document.addEventListener(
+            "pointermove",
+            dragPanel
+        );
+
+        document.addEventListener(
+            "pointerup",
+            endDrag
+        );
+    }
+
+    /*
+     * ============================================================
+     * ELEMENT INFORMATION
+     * ============================================================
+     */
+
+    function elementInfo(
+        element
+    ) {
+        if (!element) {
+            return "Not found";
+        }
+
+        const tag =
+            element.tagName
+                ?.toLowerCase() ||
+            "element";
+
+        const id =
+            element.id
+                ? `#${element.id}`
+                : "";
+
+        const classes =
+            typeof element.className ===
+                "string" &&
+            element.className
+                ? `.${element.className
+                    .trim()
+                    .split(/\s+/)
+                    .slice(
+                        0,
+                        2
+                    )
+                    .join(".")}`
+                : "";
+
+        return (
+            `${tag}${id}${classes}`
+        );
+    }
+
+    /*
+     * ============================================================
+     * UPDATE UI
+     * ============================================================
+     */
+
+    function updateUI() {
+        if (
+            !helperPanel ||
+            !document.body.contains(
+                helperPanel
+            )
+        ) {
+            return;
+        }
+
+        const field =
+            name =>
+                helperPanel.querySelector(
+                    `[data-field="${name}"]`
+                );
+
+        const setField =
+            (
+                name,
+                value
+            ) => {
+                const element =
+                    field(name);
+
+                if (element) {
+                    element.textContent =
+                        value;
+                }
+            };
+
+        setField(
+            "status",
+            settings.enabled
+                ? "ON"
+                : "OFF"
+        );
+
+        setField(
+            "state",
+            state
+        );
+
+        setField(
+            "cycle",
+            String(cycle)
+        );
+
+        setField(
+            "action",
+            lastAction
+        );
+
+        renderChestLog();
+
+        setField(
+            "chest",
+            getChestState()
+        );
+
+        /*
+         * The important distinction:
+         *
+         * Last Chest Check = actual last chest-panel reading.
+         */
+        setField(
+            "last-check",
+            lastCheckedLikes ===
+                null
+                ? "—"
+                : formatLikes(
+                    lastCheckedLikes
+                )
+        );
+
+        setField(
+            "likes",
+            currentLikes ===
+                null
+                ? "—"
+                : formatLikes(
+                    currentLikes
+                )
+        );
+
+        setField(
+            "target",
+            formatLikes(
+                settings.threshold
+            )
+        );
+
+        setField(
+            "locked",
+            lockedLikes ===
+                null
+                ? "—"
+                : formatLikes(
+                    lockedLikes
+                )
+        );
+
+        setField(
+            "recheck",
+            chestTimerEnd
+                ? formatTimer(
+                    remainingSeconds(
+                        chestTimerEnd
+                    )
+                )
+                : "—"
+        );
+
+        setField(
+            "opening",
+            openingTimerEnd
+                ? formatTimer(
+                    remainingSeconds(
+                        openingTimerEnd
+                    )
+                )
+                : "—"
+        );
+
+        setField(
+            "auto-info",
+            !settings.autoInfoEnabled
+                ? "OFF"
+                : autoInfoNextAt
+                    ? formatTimer(
+                        remainingSeconds(
+                            autoInfoNextAt
+                        )
+                    )
+                    : "Starting..."
+        );
+
+        const soundNameField =
+            helperPanel.querySelector(
+                '[data-field="open-sound-name"]'
+            );
+
+        if (soundNameField) {
+            soundNameField.textContent =
+                customOpenSoundName ||
+                "No sound selected";
+            soundNameField.title =
+                customOpenSoundName ||
+                "No sound selected";
+        }
+
+        const soundVolumeField =
+            helperPanel.querySelector(
+                '[data-field="open-sound-volume"]'
+            );
+
+        if (soundVolumeField) {
+            soundVolumeField.textContent =
+                `${Math.round(
+                    clamp(
+                        Number(settings.openSoundVolume),
+                        0,
+                        1
+                    ) * 100
+                )}%`;
+        }
+
+        setField(
+            "footer-likes",
+            lastCheckedLikes ===
+                null
+                ? "—"
+                : formatLikes(
+                    lastCheckedLikes
+                )
+        );
+
+        const toggle =
+            helperPanel.querySelector(
+                '[data-action="toggle"]'
+            );
+
+        if (toggle) {
+            toggle.textContent =
+                settings.enabled
+                    ? "ON"
+                    : "OFF";
+
+            toggle.classList.toggle(
+                "ych-off",
+                !settings.enabled
+            );
+        }
+
+        applyPanelState();
+    }
+
+    /*
+     * ============================================================
+     * STARTUP
+     * ============================================================
+     */
+
+    function start() {
+
+        if (
+            !document.body
+        ) {
+            setTimeout(
+                start,
+                500
+            );
+
+            return;
+        }
+
+        installCSS();
+
+        /* Keep the original working v9.48 panel creation method. */
+        createHelperPanel();
+
+        /* Audio is optional and initializes only after the panel exists. */
+        loadCustomOpenSound()
+            .then(() => updateUI())
+            .catch(error => {
+                console.warn(
+                    "[Chest Helper] Custom sound initialization failed:",
+                    error
+                );
+            });
+
+        updateBroadcastSafety();
+
+        if (ownBroadcastActive && settings.enabled) {
+            scheduleAutoInfo();
+        }
+
+        setAction(
+            settings.enabled
+                ? (ownBroadcastActive ? "Helper ready — waiting for chest" : "NOT LIVE — automation stopped")
+                : "Helper disabled"
+        );
+
+        /*
+         * Main polling loop.
+         *
+         * No MutationObserver.
+         */
+        setInterval(
+            async () => {
+                /*
+                 * processState() contains awaits. Never allow two
+                 * state-machine executions to overlap.
+                 */
+                if (processStateBusy) {
+                    return;
+                }
+
+                processStateBusy = true;
+
+                try {
+                    await processState();
+
+                    recovery();
+
+                    updateUI();
+                } catch (error) {
+                    console.error(
+                        "[Chest Helper] Main loop error:",
+                        error
+                    );
+
+                    setAction(
+                        `Runtime error: ${
+                            error?.message ||
+                            error
+                        }`
+                    );
+                } finally {
+                    processStateBusy = false;
+                }
+            },
+            500
+        );
+
+        /*
+         * Faster UI refresh for timers.
+         */
+        setInterval(
+            () => {
+                try {
+                    updateUI();
+                } catch (_) {}
+            },
+            250
+        );
+    }
+
+    start();
+
+})();
