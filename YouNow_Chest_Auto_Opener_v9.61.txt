@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         YouNow Treasure Chest Auto Opener
 // @namespace    https://younow.com/
-// @version      9.61
+// @version      9.62
 // @description  YouNow Treasure Chest automation with live chest likes detection, v9.50 base with live likes-check window, timer-driven chest-panel likes checks, and optional custom chest-open audio, reliable Winners-panel cleanup, and persistent chest history.
 // @author       James McKay
 // @match        https://www.younow.com/*
