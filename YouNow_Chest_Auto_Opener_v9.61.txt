@@ -1,21 +1,22 @@
 // ==UserScript==
 // @name         YouNow Treasure Chest Auto Opener
 // @namespace    https://younow.com/
-// @version      9.62
-// @description  YouNow Treasure Chest automation with live chest likes detection, v9.50 base with live likes-check window, timer-driven chest-panel likes checks, and optional custom chest-open audio, reliable Winners-panel cleanup, and persistent chest history.
-// @author       James McKay
+// @version      9.72
+// @description  YouNow Treasure Chest automation with API-driven chest opening, optional audio, Winners cleanup, and persistent chest history.
+// @author       Cenastor
 // @match        https://www.younow.com/*
 // @match        https://younow.com/*
 // @grant        GM_getValue
 // @grant        GM_setValue
 // @grant        GM_addStyle
+// @grant        unsafeWindow
 // @run-at       document-idle
 // ==/UserScript==
 
 (function () {
     "use strict";
 
-    const VERSION = "9.62";
+    const VERSION = "9.72";
 
     /*
      * Keep the existing storage key for compatibility.
@@ -33,12 +34,29 @@
     const MAX_LOG_ENTRIES = 100;
 
     /*
-     * While a chest likes check is active, keep the real chest panel
-     * open for a short live-check window. This catches likes that arrive
-     * while the check is in progress instead of closing the panel on the
-     * first below-target reading. It is a bounded check, not a recheck timer.
+     * Keep sampling the read-only chest API briefly during each check so
+     * likes arriving during the check are included.
      */
     const LIVE_LIKES_CHECK_WINDOW_MS = 5000;
+
+    /*
+     * The chest API is refreshed while the user's own broadcast is live.
+     * A fresh API snapshot drives chest state, likes, and the direct open.
+     */
+    const CHEST_API_URL =
+        "https://api.younow.com/php/api/props/getCurrentChest";
+
+    const CHEST_API_OPEN_URL =
+        "https://api.younow.com/php/api/props/propsChestOpen";
+
+    const CHEST_API_REFRESH_INTERVAL_MS = 3000;
+
+    const CHEST_API_SNAPSHOT_MAX_AGE_MS = 10000;
+
+    const pageWindow =
+        typeof unsafeWindow !== "undefined"
+            ? unsafeWindow
+            : window;
 
     const DEFAULTS = {
         enabled: true,
@@ -198,7 +216,7 @@
     }
 
     async function playCustomOpenSound(force = false) {
-        if (!detectOwnBroadcasting()) return false;
+        if (!updateBroadcastSafety()) return false;
         if (!force && !settings.openSoundEnabled) return false;
         if (!soundReady) await loadCustomOpenSound();
         if (!soundReady || !customOpenSoundObjectUrl) {
@@ -265,11 +283,8 @@
         WAITING_FOR_OPEN_DELAY:
             "WAITING_FOR_OPEN_DELAY",
 
-        CLICKING_CHEST:
-            "CLICKING_CHEST",
-
-        CLICKING_OPEN:
-            "CLICKING_OPEN",
+        OPENING_VIA_API:
+            "OPENING_VIA_API",
 
         WAITING_FOR_RAIN:
             "WAITING_FOR_RAIN",
@@ -455,6 +470,15 @@
     /* BROADCAST SAFETY: visible YouNow END button = live. */
     let ownBroadcastActive = false;
     let broadcastDetectionInitialized = false;
+
+    let chestApiSnapshot = null;
+    let chestApiSnapshotAt = 0;
+    let chestApiLastFetchAt = 0;
+    let chestApiRequestInFlight = false;
+    let chestApiContextKey = "";
+    let chestApiSnapshotPageUrl = String(pageWindow.location.href || "");
+    let chestApiOpenAttemptedId = "";
+    let chestOpenConfirmedForCycle = false;
 
     /* TIMER-OFF CONTROL: no timer; check once on AVAILABLE and once before opening. */
     let lastObservedChestState = "UNKNOWN";
@@ -1088,22 +1112,15 @@
     function findBroadcastEndButton() {
         const candidates = Array.from(
             document.querySelectorAll(
-                'button, [role="button"], input[type="button"], input[type="submit"]'
+                'button.button.button--small.button--red'
             )
-        ).filter(isVisible);
+        );
 
-        for (const element of candidates) {
-            const text = normalizeText(element.textContent);
-            const aria = normalizeText(element.getAttribute("aria-label"));
-            const title = normalizeText(element.getAttribute("title"));
-            const value = normalizeText(element.value);
-
-            /* Exact END control only. Do not scan arbitrary page text. */
-            if (text === "end" || aria === "end" || title === "end" || value === "end") {
-                return element;
-            }
-        }
-        return null;
+        return candidates.find(
+            button =>
+                isVisible(button) &&
+                String(button.textContent || "").trim() === "END"
+        ) || null;
     }
 
     function detectOwnBroadcasting() {
@@ -1124,6 +1141,8 @@
         likesLockedForCycle = false;
         cycleLocked = false;
         preOpenVerification = false;
+        openedChestRecordedForCycle = false;
+        winnerCloseAttempts = 0;
         lastObservedChestState = getChestState();
         offModeCheckedForAvailableChest = false;
         state = STATES.OFF;
@@ -1136,6 +1155,7 @@
             if (ownBroadcastActive || !broadcastDetectionInitialized) {
                 ownBroadcastActive = false;
                 broadcastDetectionInitialized = true;
+                resetChestApiSnapshot();
                 resetAutomationForNonBroadcast();
                 if (settings.enabled) {
                     setAction("NOT LIVE — automation stopped (END button not found)");
@@ -1147,6 +1167,7 @@
         if (!ownBroadcastActive) {
             ownBroadcastActive = true;
             broadcastDetectionInitialized = true;
+            resetChestApiSnapshot();
             chestTimerEnd = null;
             openingTimerEnd = null;
             autoInfoNextAt = null;
@@ -1160,6 +1181,10 @@
             likesLockedForCycle = false;
             cycleLocked = false;
             preOpenVerification = false;
+            openedChestRecordedForCycle = false;
+            winnerCloseAttempts = 0;
+            stateStartedAt = Date.now();
+            recoveryStartedAt = Date.now();
             /* Force a fresh AVAILABLE check after going live. */
             lastObservedChestState = "UNKNOWN";
             offModeCheckedForAvailableChest = false;
@@ -1169,6 +1194,30 @@
                 setAction("LIVE — END button detected; automation active");
             }
         }
+        return true;
+    }
+
+    function canPerformAutomatedAction(requireAvailableChest = false) {
+        if (!updateBroadcastSafety()) {
+            return false;
+        }
+
+        const chestState = getChestState();
+
+        if (chestState === "UNKNOWN") {
+            if (lastAction !== "Chest state UNKNOWN — waiting before automated action") {
+                setAction("Chest state UNKNOWN — waiting before automated action");
+            }
+            return false;
+        }
+
+        if (requireAvailableChest && chestState !== "AVAILABLE") {
+            if (lastAction !== "Chest UNAVAILABLE — waiting before chest action") {
+                setAction("Chest UNAVAILABLE — waiting before chest action");
+            }
+            return false;
+        }
+
         return true;
     }
 
@@ -1186,16 +1235,288 @@
                 )
             );
 
-        return (
-            buttons.find(
-                isVisible
-            ) ||
-            buttons[0] ||
-            null
-        );
+        return buttons.find(isVisible) || null;
     }
 
-    function getChestState() {
+    function getChestApiParameter(resourceName, parameterName) {
+        try {
+            const parsed =
+                new URL(
+                    resourceName,
+                    pageWindow.location.href
+                );
+
+            const prefix =
+                `${parameterName}=`;
+
+            const pathSegment =
+                parsed.pathname
+                    .split("/")
+                    .find(
+                        segment =>
+                            segment.startsWith(prefix)
+                    );
+
+            if (pathSegment) {
+                const value =
+                    pathSegment.slice(prefix.length);
+
+                try {
+                    return decodeURIComponent(value);
+                } catch (_) {
+                    return value;
+                }
+            }
+
+            return parsed.searchParams.get(parameterName);
+        } catch (_) {
+            return null;
+        }
+    }
+
+    function findLatestChestApiParameter(routePart, parameterName) {
+        try {
+            const entries =
+                pageWindow.performance
+                    .getEntriesByType("resource")
+                    .filter(
+                        entry =>
+                            typeof entry.name === "string" &&
+                            entry.name.includes(routePart)
+                    )
+                    .sort(
+                        (a, b) =>
+                            (b.startTime || 0) -
+                            (a.startTime || 0)
+                    );
+
+            for (const entry of entries) {
+                const value =
+                    getChestApiParameter(
+                        entry.name,
+                        parameterName
+                    );
+
+                if (value) {
+                    return value;
+                }
+            }
+        } catch (_) {}
+
+        return null;
+    }
+
+    function getChestApiContext() {
+        const userId =
+            findLatestChestApiParameter(
+                "/php/api/younow/notificationCount",
+                "userId"
+            );
+
+        const channelId =
+            findLatestChestApiParameter(
+                "/php/api/channel/getStickers",
+                "channelId"
+            );
+
+        if (!userId || !channelId) {
+            return null;
+        }
+
+        return {
+            userId,
+            channelId
+        };
+    }
+
+    function resetChestApiSnapshot() {
+        chestApiSnapshot = null;
+        chestApiSnapshotAt = 0;
+        chestApiLastFetchAt = 0;
+        chestApiContextKey = "";
+        chestApiSnapshotPageUrl =
+            String(pageWindow.location.href || "");
+    }
+
+    function getFreshChestApiSnapshot() {
+        if (
+            !ownBroadcastActive ||
+            !chestApiSnapshot ||
+            Date.now() - chestApiSnapshotAt >
+                CHEST_API_SNAPSHOT_MAX_AGE_MS ||
+            String(pageWindow.location.href || "") !==
+                chestApiSnapshotPageUrl
+        ) {
+            return null;
+        }
+
+        return chestApiSnapshot;
+    }
+
+    async function refreshChestApiSnapshot(force = false) {
+        const currentPageUrl =
+            String(pageWindow.location.href || "");
+
+        if (
+            currentPageUrl !==
+            chestApiSnapshotPageUrl
+        ) {
+            resetChestApiSnapshot();
+        }
+
+        if (
+            !ownBroadcastActive ||
+            chestApiRequestInFlight ||
+            (!force &&
+                Date.now() - chestApiLastFetchAt <
+                    CHEST_API_REFRESH_INTERVAL_MS)
+        ) {
+            return;
+        }
+
+        chestApiLastFetchAt = Date.now();
+
+        const context =
+            getChestApiContext();
+
+        if (!context) {
+            return;
+        }
+
+        const contextKey =
+            `${context.userId}:${context.channelId}`;
+
+        if (contextKey !== chestApiContextKey) {
+            chestApiSnapshot = null;
+            chestApiSnapshotAt = 0;
+            chestApiContextKey = contextKey;
+        }
+
+        const pageFetch =
+            pageWindow.fetch;
+
+        if (typeof pageFetch !== "function") {
+            return;
+        }
+
+        const endpoint =
+            `${CHEST_API_URL}/userId=${encodeURIComponent(context.userId)}` +
+            `/channelId=${encodeURIComponent(context.channelId)}`;
+
+        const requestPageUrl =
+            currentPageUrl;
+
+        chestApiRequestInFlight = true;
+
+        try {
+            const response =
+                await pageFetch.call(
+                    pageWindow,
+                    endpoint,
+                    {
+                        method: "GET",
+                        credentials: "include",
+                        cache: "no-store"
+                    }
+                );
+
+            if (!response.ok) {
+                return;
+            }
+
+            const payload =
+                await response.json();
+
+            if (
+                String(pageWindow.location.href || "") !==
+                    requestPageUrl ||
+                contextKey !== chestApiContextKey ||
+                Number(payload?.errorCode) !== 0
+            ) {
+                return;
+            }
+
+            const chest =
+                payload?.propsChest;
+
+            if (!chest || typeof chest !== "object") {
+                chestApiSnapshot = {
+                    hasChest: false,
+                    chestId: "",
+                    state: "CHEST_UNAVAILABLE",
+                    likes: null,
+                    minLikesToAvailable: null
+                };
+                chestApiSnapshotAt = Date.now();
+                return;
+            }
+
+            const likes =
+                chest.likes === null ||
+                chest.likes === undefined
+                    ? null
+                    : Number(chest.likes);
+
+            const minLikesToAvailable =
+                chest.minLikesToAvailable === null ||
+                chest.minLikesToAvailable === undefined
+                    ? null
+                    : Number(chest.minLikesToAvailable);
+
+            chestApiSnapshot = {
+                hasChest: true,
+                chestId: String(chest.id ?? ""),
+                state: String(chest.state || ""),
+                likes: Number.isFinite(likes) ? likes : null,
+                minLikesToAvailable:
+                    Number.isFinite(minLikesToAvailable)
+                        ? minLikesToAvailable
+                        : null
+            };
+
+            chestApiSnapshotAt = Date.now();
+        } catch (_) {
+            /* Keep using the existing DOM detector if the API is unavailable. */
+        } finally {
+            chestApiRequestInFlight = false;
+        }
+    }
+
+    function getChestApiState(snapshot) {
+        if (!snapshot) {
+            return "UNKNOWN";
+        }
+
+        if (!snapshot.hasChest) {
+            return "UNAVAILABLE";
+        }
+
+        const apiState =
+            String(snapshot.state || "")
+                .trim()
+                .toUpperCase();
+
+        if (
+            apiState === "CHEST_UNAVAILABLE" ||
+            apiState === "UNAVAILABLE" ||
+            apiState === "CHEST_OPEN" ||
+            apiState === "WAITING_FOR_RESULTS"
+        ) {
+            return "UNAVAILABLE";
+        }
+
+        if (
+            apiState === "CHEST_AVAILABLE" ||
+            apiState === "AVAILABLE" ||
+            /^CHEST_OVERFLOWING_[1-5]$/.test(apiState)
+        ) {
+            return "AVAILABLE";
+        }
+
+        return "UNKNOWN";
+    }
+
+    function getChestStateFromDOM() {
         const button =
             getChestButton();
 
@@ -1213,27 +1534,54 @@
         }
 
         const src =
-            image.currentSrc ||
-            image.src ||
-            "";
+            String(image.getAttribute("src") || "")
+                .replace(/\s+/g, "");
 
         if (
-            src.includes(
-                "/available.svg"
-            )
-        ) {
-            return "AVAILABLE";
-        }
-
-        if (
-            src.includes(
-                "/unavailable.svg"
-            )
+            src.includes("/unavailable.svg")
         ) {
             return "UNAVAILABLE";
         }
 
+        if (
+            src.includes("/available.svg")
+        ) {
+            return "AVAILABLE";
+        }
+
         return "UNKNOWN";
+    }
+
+    function getChestState() {
+        const apiState =
+            getChestApiState(
+                getFreshChestApiSnapshot()
+            );
+
+        if (apiState !== "UNKNOWN") {
+            return apiState;
+        }
+
+        return getChestStateFromDOM();
+    }
+
+    function getChestStateLabel() {
+        const chestState =
+            getChestState();
+
+        const snapshot =
+            getFreshChestApiSnapshot();
+
+        if (
+            !snapshot ||
+            !snapshot.hasChest ||
+            snapshot.likes === null ||
+            snapshot.minLikesToAvailable === null
+        ) {
+            return chestState;
+        }
+
+        return `${chestState} (${formatLikes(snapshot.likes)} / ${formatLikes(snapshot.minLikesToAvailable)})`;
     }
 
     function isChestAvailable() {
@@ -1385,6 +1733,10 @@
                 continue;
             }
 
+            if (!canPerformAutomatedAction()) {
+                return false;
+            }
+
             try {
                 cancel.click();
 
@@ -1425,6 +1777,10 @@
          * Never click the chest button to close it.
          */
         try {
+            if (!canPerformAutomatedAction()) {
+                return false;
+            }
+
             document.dispatchEvent(
                 new KeyboardEvent(
                     "keydown",
@@ -1517,9 +1873,8 @@
      * ============================================================
      * CHEST LIKES
      *
-     * IMPORTANT:
-     * Only the actual sidebar chest panel is read.
-     * This works for both AVAILABLE and UNAVAILABLE chest panels.
+     * Use only the fresh read-only API snapshot. The page's displayed
+     * counter is not used to decide whether an API open may be sent.
      * ============================================================
      */
 
@@ -1532,118 +1887,23 @@
             return null;
         }
 
-        const panel =
-            getChestCheckPanel();
-
-        if (!panel) {
-            return null;
-        }
-
-        const valueElement =
-            panel.querySelector(
-                '.total-likes .value'
-            );
+        const apiSnapshot =
+            getFreshChestApiSnapshot();
 
         if (
-            !valueElement ||
-            !isVisible(
-                valueElement
-            )
+            apiSnapshot &&
+            apiSnapshot.likes !== null
         ) {
-            return null;
+            lastCheckedLikes =
+                apiSnapshot.likes;
+
+            currentLikes =
+                apiSnapshot.likes;
+
+            return apiSnapshot.likes;
         }
 
-        const likes =
-            parseYouNowNumber(
-                valueElement.textContent
-            );
-
-        if (
-            likes === null
-        ) {
-            return null;
-        }
-
-        /* THIS is the authoritative value for {likes}. */
-        lastCheckedLikes =
-            likes;
-
-        currentLikes =
-            likes;
-
-        return likes;
-    }
-
-    /*
-     * ============================================================
-     * OPEN CHEST CHECK PANEL
-     * ============================================================
-     */
-
-    async function openChestPanel(allowUnavailable = false) {
-        if (!detectOwnBroadcasting()) {
-            return false;
-        }
-
-        if (
-            isChestCheckPanelOpen()
-        ) {
-            return true;
-        }
-
-        const button =
-            getChestButton();
-
-        if (
-            !button ||
-            !isVisible(button)
-        ) {
-            return false;
-        }
-
-        /*
-         * Normal opening requires AVAILABLE. A scheduled likes check
-         * may explicitly pass allowUnavailable=true so the unavailable
-         * education panel can be opened and its real likes read.
-         */
-        if (
-            !allowUnavailable &&
-            !isChestAvailable()
-        ) {
-            return false;
-        }
-
-        try {
-            button.click();
-        } catch (error) {
-            console.warn(
-                '[Chest Helper] Chest button click failed:',
-                error
-            );
-
-            return false;
-        }
-
-        const started =
-            Date.now();
-
-        while (
-            Date.now() -
-                started <
-            5000
-        ) {
-            if (
-                isChestCheckPanelOpen()
-            ) {
-                return true;
-            }
-
-            await sleep(
-                100
-            );
-        }
-
-        return false;
+        return null;
     }
 
     /*
@@ -1770,6 +2030,10 @@
             const isGotIt =
                 label === 'got it';
 
+            if (!canPerformAutomatedAction()) {
+                return false;
+            }
+
             try {
                 closeButton.click();
 
@@ -1815,6 +2079,10 @@
             'Chest panel did not close with its close control — using Escape fallback'
         );
 
+        if (!canPerformAutomatedAction()) {
+            return false;
+        }
+
         document.dispatchEvent(
             new KeyboardEvent(
                 'keydown',
@@ -1848,74 +2116,230 @@
     }
 
     /*
-     * ============================================================
-     * CHEST LIKES / OPENING MODAL HELPERS
-     *
-     * The functions below intentionally continue using
-     * getTreasureChestModal(). That modal is the separate Open/Cancel
-     * dialog used only after the chest has reached the threshold.
-     * ============================================================
+     * Open the broadcaster's current chest through the same first-party
+     * API action used by YouNow's client. The API snapshot is checked again
+     * immediately before sending the POST so stale page state cannot gate
+     * or trigger an open.
      */
+    function getStoredYouNowValue(key) {
+        try {
+            const raw =
+                pageWindow.localStorage.getItem(key);
 
-    /*
-     * ============================================================
-     * OPEN BUTTON
-     * ============================================================
-     */
+            if (raw === null || raw === undefined) {
+                return "";
+            }
 
-    function findChestOpenButton() {
-        const modal =
-            getTreasureChestModal();
-
-        if (!modal) {
-            return null;
+            try {
+                const parsed = JSON.parse(raw);
+                return String(parsed ?? "");
+            } catch (_) {
+                return String(raw);
+            }
+        } catch (_) {
+            return "";
         }
-
-        return (
-            Array.from(
-                modal.querySelectorAll(
-                    "button"
-                )
-            )
-                .filter(
-                    isVisible
-                )
-                .find(
-                    button =>
-                        normalizeText(
-                            button.textContent
-                        ) ===
-                        "open"
-                ) ||
-            null
-        );
     }
 
-    function clickChestOpenButton() {
-        if (!detectOwnBroadcasting()) return false;
-
-        const button =
-            findChestOpenButton();
-
-        if (!button) {
-            return false;
+    async function openChestViaApi() {
+        if (!updateBroadcastSafety()) {
+            return "blocked";
         }
 
+        const context =
+            getChestApiContext();
+
+        const apiUserId =
+            Number(context?.userId);
+
+        const snapshot =
+            getFreshChestApiSnapshot();
+
+        if (
+            !context ||
+            !Number.isSafeInteger(apiUserId) ||
+            apiUserId <= 0
+        ) {
+            setAction(
+                "Signed-in user ID is invalid — API open request not sent"
+            );
+            return "blocked";
+        }
+
+        if (
+            !snapshot ||
+            !snapshot.hasChest ||
+            !snapshot.chestId
+        ) {
+            setAction(
+                "API chest data is missing or stale — open request not sent"
+            );
+            return "blocked";
+        }
+
+        if (
+            chestApiOpenAttemptedId ===
+            snapshot.chestId
+        ) {
+            setAction(
+                "Open already attempted for this chest — waiting for its API state to change"
+            );
+            return "blocked";
+        }
+
+        if (
+            getChestApiState(snapshot) !== "AVAILABLE" ||
+            snapshot.likes === null ||
+            snapshot.minLikesToAvailable === null ||
+            snapshot.likes < snapshot.minLikesToAvailable
+        ) {
+            setAction(
+                "API says chest is not ready — open request not sent"
+            );
+            return "blocked";
+        }
+
+        const pageFetch =
+            pageWindow.fetch;
+
+        if (typeof pageFetch !== "function") {
+            setAction(
+                "Browser fetch is unavailable — API open request not sent"
+            );
+            return "blocked";
+        }
+
+        const requestPageUrl =
+            String(pageWindow.location.href || "");
+
+        const formData =
+            new URLSearchParams();
+
+        formData.set(
+            "userId",
+            String(apiUserId)
+        );
+
+        const trpxId =
+            getStoredYouNowValue("TRPX_ID");
+
+        const trpxDeviceId =
+            getStoredYouNowValue("TRPX_DEVICE_ID");
+
+        const language =
+            getStoredYouNowValue("UI_LANGUAGE") ||
+            String(document.documentElement.lang || "en");
+
+        if (trpxId) {
+            formData.set("tsi", trpxId);
+        }
+
+        if (trpxDeviceId) {
+            formData.set("tdi", trpxDeviceId);
+        }
+
+        formData.set("lang", language);
+
+        const headers = {
+            "Content-Type":
+                "application/x-www-form-urlencoded; charset=UTF-8"
+        };
+
+        const requestBy =
+            getStoredYouNowValue("REQUEST_BY");
+
+        if (requestBy) {
+            headers["X-Requested-By"] = requestBy;
+        }
+
+        /* Lock this chest before sending; a lost response must not cause a duplicate open. */
+        chestApiOpenAttemptedId =
+            snapshot.chestId;
+
         try {
-            button.click();
+            const response =
+                await pageFetch.call(
+                    pageWindow,
+                    CHEST_API_OPEN_URL,
+                    {
+                        method: "POST",
+                        credentials: "include",
+                        cache: "no-store",
+                        headers,
+                        body: formData.toString()
+                    }
+                );
+
+            let payload = null;
+
+            try {
+                payload = await response.json();
+            } catch (_) {}
+
+            const apiErrorMessage =
+                String(
+                    payload?.errorMsg ||
+                    payload?.errorMessage ||
+                    payload?.message ||
+                    payload?.error ||
+                    ""
+                )
+                    .replace(/\s+/g, " ")
+                    .trim()
+                    .slice(0, 120);
+
+            const apiErrorSuffix =
+                apiErrorMessage
+                    ? ` — ${apiErrorMessage}`
+                    : "";
+
+            if (!response.ok) {
+                setAction(
+                    `YouNow API open failed (${response.status})${apiErrorSuffix} — no automatic retry for this chest`
+                );
+                return "failed";
+            }
+
+            if (Number(payload?.errorCode) !== 0) {
+                setAction(
+                    `YouNow rejected the API open request (error ${payload?.errorCode ?? "unknown"})${apiErrorSuffix}`
+                );
+                return "failed";
+            }
+
+            if (
+                String(pageWindow.location.href || "") !==
+                requestPageUrl
+            ) {
+                setAction(
+                    "API open succeeded after the page changed — stopped automation"
+                );
+                return "failed";
+            }
+
+            chestApiSnapshot = {
+                ...snapshot,
+                state: "CHEST_OPEN"
+            };
+            chestApiSnapshotAt = Date.now();
+            chestOpenConfirmedForCycle = true;
 
             setAction(
-                "Open clicked"
+                `Chest opened through YouNow API (${formatLikes(snapshot.likes)} likes)`
             );
 
-            return true;
+            return "opened";
         } catch (error) {
             console.warn(
-                "[Chest Helper] Open failed:",
+                "[Chest Helper] API chest open failed:",
                 error
             );
 
-            return false;
+            setAction(
+                "API open response was uncertain — no automatic retry for this chest"
+            );
+
+            return "failed";
         }
     }
 
@@ -1947,7 +2371,7 @@
     }
 
     function clickMakeItRain() {
-        if (!detectOwnBroadcasting()) return false;
+        if (!canPerformAutomatedAction()) return false;
 
         const button =
             findMakeItRainButton();
@@ -2002,7 +2426,7 @@
     }
 
     function clickTellThem() {
-        if (!detectOwnBroadcasting()) return false;
+        if (!canPerformAutomatedAction()) return false;
 
         const button =
             findTellThemButton();
@@ -2257,7 +2681,7 @@
     }
 
     function clickWinnerCloseControl(button) {
-        if (!button) {
+        if (!button || !canPerformAutomatedAction()) {
             return false;
         }
 
@@ -2298,6 +2722,10 @@
                 })
             );
 
+            if (!canPerformAutomatedAction()) {
+                return false;
+            }
+
             button.click();
 
             return true;
@@ -2308,6 +2736,10 @@
             );
 
             try {
+                if (!canPerformAutomatedAction()) {
+                    return false;
+                }
+
                 button.click();
                 return true;
             } catch (_) {
@@ -2337,6 +2769,10 @@
                 setAction(
                     "Winners Close control unavailable — using Escape"
                 );
+
+                if (!canPerformAutomatedAction()) {
+                    return false;
+                }
 
                 document.dispatchEvent(
                     new KeyboardEvent("keydown", {
@@ -2380,6 +2816,10 @@
         }
 
         if (winnerCloseAttempts >= 4) {
+            if (!canPerformAutomatedAction()) {
+                return false;
+            }
+
             document.dispatchEvent(
                 new KeyboardEvent("keydown", {
                     key: "Escape",
@@ -2511,7 +2951,7 @@
     function sendChatMessage(
         message
     ) {
-        if (!detectOwnBroadcasting()) {
+        if (!updateBroadcastSafety()) {
             setAction("Chat blocked — END button not found");
             return false;
         }
@@ -2590,7 +3030,7 @@
      *       panel check.
      *
      * {threshold}
-     *     = configured threshold.
+     *     = API chest minimum when available, otherwise the fallback target.
      *
      * {lockedLikes}
      *     = likes value locked when threshold was reached.
@@ -2605,6 +3045,20 @@
      *     = current timer remaining.
      * ============================================================
      */
+
+    function getCurrentChestThreshold() {
+        const snapshot =
+            getFreshChestApiSnapshot();
+
+        if (
+            snapshot &&
+            snapshot.minLikesToAvailable !== null
+        ) {
+            return snapshot.minLikesToAvailable;
+        }
+
+        return settings.threshold;
+    }
 
     function replaceVariables(
         message
@@ -2646,7 +3100,7 @@
             .replace(
                 /\{threshold\}/gi,
                 formatLikes(
-                    settings.threshold
+                    getCurrentChestThreshold()
                 )
             )
             .replace(
@@ -2706,7 +3160,9 @@
 
     function scheduleAutoInfo() {
         if (
-            !settings.autoInfoEnabled
+            !settings.autoInfoEnabled ||
+            !ownBroadcastActive ||
+            !detectOwnBroadcasting()
         ) {
             autoInfoNextAt =
                 null;
@@ -2722,7 +3178,7 @@
     }
 
     function processAutoInfo() {
-        if (!detectOwnBroadcasting()) {
+        if (!updateBroadcastSafety()) {
             return;
         }
 
@@ -2754,7 +3210,11 @@
             message
         );
 
-        scheduleAutoInfo();
+        if (ownBroadcastActive) {
+            scheduleAutoInfo();
+        } else {
+            autoInfoNextAt = null;
+        }
     }
 
     /*
@@ -2845,6 +3305,9 @@
         openedChestRecordedForCycle =
             false;
 
+        chestOpenConfirmedForCycle =
+            false;
+
         soundPlayedForCycle =
             false;
 
@@ -2921,6 +3384,8 @@
             return;
         }
 
+        void refreshChestApiSnapshot();
+
         if (
             !settings.enabled
         ) {
@@ -2941,10 +3406,48 @@
 
                 {
                     const chestState = getChestState();
+                    const apiSnapshot =
+                        getFreshChestApiSnapshot();
+                    const apiChestState =
+                        getChestApiState(apiSnapshot);
+                    const attemptedChestId =
+                        chestApiOpenAttemptedId;
+
+                    if (
+                        chestApiOpenAttemptedId &&
+                        apiSnapshot &&
+                        (
+                            apiSnapshot.chestId !==
+                                chestApiOpenAttemptedId ||
+                            apiChestState === "UNAVAILABLE"
+                        )
+                    ) {
+                        chestApiOpenAttemptedId = "";
+
+                        if (
+                            apiSnapshot.chestId &&
+                            apiSnapshot.chestId !==
+                                attemptedChestId
+                        ) {
+                            offModeCheckedForAvailableChest = false;
+                            lastObservedChestState = "UNAVAILABLE";
+                        }
+                    }
+
+                    if (
+                        chestApiOpenAttemptedId &&
+                        apiSnapshot &&
+                        apiSnapshot.chestId ===
+                            chestApiOpenAttemptedId
+                    ) {
+                        lastObservedChestState =
+                            chestState;
+                        return;
+                    }
 
                     /* Preserve existing behavior when the recheck timer is ON. */
                     if (settings.timerEnabled) {
-                        if (getChestButton() && !cycleLocked) {
+                        if (chestState !== "UNKNOWN" && !cycleLocked) {
                             beginFreshCycle();
                         }
                         lastObservedChestState = chestState;
@@ -2985,16 +3488,16 @@
                     return;
                 }
 
-                /*
-                 * The chest panel is opened/read while the chest is
-                 * unavailable too. The panel must remain open until the
-                 * real likes value has actually been read.
-                 */
+                const apiSnapshot =
+                    getFreshChestApiSnapshot();
+
                 if (
-                    isChestCheckPanelOpen()
+                    apiSnapshot &&
+                    apiSnapshot.hasChest &&
+                    apiSnapshot.likes !== null
                 ) {
                     setAction(
-                        "Chest panel already open — reading likes"
+                        "Checking live chest likes through the API"
                     );
 
                     likesCheckDeadline =
@@ -3008,21 +3511,9 @@
                     return;
                 }
 
-                if (
-                    await openChestPanel(true)
-                ) {
-                    setAction(
-                        "Treasure Chest panel opened"
-                    );
-
-                    likesCheckDeadline =
-                        Date.now() +
-                        LIVE_LIKES_CHECK_WINDOW_MS;
-
-                    setState(
-                        STATES.READING_LIKES
-                    );
-                }
+                setAction(
+                    "Waiting for a fresh chest API reading"
+                );
 
                 return;
 
@@ -3058,9 +3549,18 @@
                     likesReadThisCheck =
                         true;
 
+                    const effectiveThreshold =
+                        getCurrentChestThreshold();
+
+                    const apiChestAvailable =
+                        getChestApiState(
+                            getFreshChestApiSnapshot()
+                        ) === "AVAILABLE";
+
+                    /* The API's available state overrides the fallback target. */
                     if (
-                        likes <
-                        settings.threshold
+                        likes < effectiveThreshold &&
+                        !apiChestAvailable
                     ) {
                         /*
                          * Keep the actual chest panel open briefly while
@@ -3087,7 +3587,7 @@
 
                         if (remaining > 0 && isChestAvailable()) {
                             setAction(
-                                `Watching live chest likes: ${formatLikes(likes)} / ${formatLikes(settings.threshold)} — ${Math.ceil(remaining / 1000)}s left`
+                                `Watching live chest likes: ${formatLikes(likes)} / ${formatLikes(effectiveThreshold)} — ${Math.ceil(remaining / 1000)}s left`
                             );
 
                             return;
@@ -3097,7 +3597,7 @@
                             null;
 
                         setAction(
-                            `Chest likes ${formatLikes(likes)} / ${formatLikes(settings.threshold)} — check complete`
+                            `Chest likes ${formatLikes(likes)} / ${formatLikes(effectiveThreshold)} — check complete`
                         );
 
                         setState(
@@ -3171,7 +3671,7 @@
                         preOpenVerification = false;
                         checkCycleInProgress = false;
                         setAction(`Final likes check passed: ${formatLikes(likes)} — opening now`);
-                        setState(STATES.CLICKING_CHEST);
+                        setState(STATES.OPENING_VIA_API);
                         return;
                     }
 
@@ -3290,6 +3790,13 @@
                     Date.now() >=
                         chestTimerEnd
                 ) {
+                    if (getChestState() === "UNKNOWN") {
+                        if (lastAction !== "Chest state UNKNOWN — recheck is waiting") {
+                            setAction("Chest state UNKNOWN — recheck is waiting");
+                        }
+                        return;
+                    }
+
                     chestTimerEnd =
                         null;
 
@@ -3343,6 +3850,10 @@
                     Date.now() >=
                         openingTimerEnd
                 ) {
+                    if (!canPerformAutomatedAction(true)) {
+                        return;
+                    }
+
                     openingTimerEnd = null;
 
                     /* Timer OFF: one final live likes check immediately before opening. */
@@ -3362,12 +3873,12 @@
                     }
 
                     setAction("Opening delay complete");
-                    setState(STATES.CLICKING_CHEST);
+                    setState(STATES.OPENING_VIA_API);
                 }
 
                 return;
 
-            case STATES.CLICKING_CHEST:
+            case STATES.OPENING_VIA_API:
 
                 if (
                     isChestModalOpen()
@@ -3388,6 +3899,10 @@
                     return;
                 }
 
+                if (!updateBroadcastSafety()) {
+                    return;
+                }
+
                 if (
                     settings.openingChatEnabled &&
                     !openingChatSent
@@ -3395,41 +3910,8 @@
                     sendOpeningAnnouncement();
                 }
 
-                const chestButton =
-                    getChestButton();
-
-                if (
-                    !chestButton ||
-                    !isVisible(
-                        chestButton
-                    )
-                ) {
-                    return;
-                }
-
-                try {
-                    chestButton.click();
-
-                    setAction(
-                        `Actual chest clicked — locked likes ${formatLikes(lockedLikes)}`
-                    );
-
-                    setState(
-                        STATES.CLICKING_OPEN
-                    );
-                } catch (error) {
-                    console.warn(
-                        "[Chest Helper] Actual chest click failed:",
-                        error
-                    );
-                }
-
-                return;
-
-            case STATES.CLICKING_OPEN:
-
-                /* Never reread likes here. Play the optional custom
-                 * sound immediately before the real Open click. */
+                /* Never reread likes here. The API snapshot below is the
+                 * authority for this direct server-side open. */
                 if (
                     !soundPlayedForCycle &&
                     settings.openSoundEnabled
@@ -3438,9 +3920,16 @@
                     soundPlayedForCycle = true;
                 }
 
-                if (
-                    clickChestOpenButton()
-                ) {
+                if (chestApiRequestInFlight) {
+                    return;
+                }
+
+                await refreshChestApiSnapshot(true);
+
+                const openResult =
+                    await openChestViaApi();
+
+                if (openResult === "opened") {
                     setState(
                         STATES.WAITING_FOR_RAIN
                     );
@@ -3448,19 +3937,16 @@
                     return;
                 }
 
-                if (
-                    Date.now() -
-                        stateStartedAt >
-                    15000
-                ) {
-                    setAction(
-                        "Open button timeout — continuing recovery"
-                    );
+                cycleLocked = false;
+                likesLockedForCycle = false;
+                currentLikes = null;
+                lockedLikes = null;
+                preOpenVerification = false;
+                openingChatSent = false;
 
-                    setState(
-                        STATES.WAITING_FOR_RAIN
-                    );
-                }
+                setState(
+                    STATES.WAITING_FOR_CHEST
+                );
 
                 return;
 
@@ -3524,14 +4010,34 @@
 
                 return;
 
-            case STATES.WAITING_FOR_CHEST_RESET:
+            case STATES.WAITING_FOR_CHEST_RESET: {
 
                 /*
                  * Do not reread likes.
                  */
+                const resetState = getChestState();
+
+                if (resetState === "UNKNOWN") {
+                    if (chestOpenConfirmedForCycle) {
+                        if (lastAction !== "API open confirmed — continuing Winners cleanup despite unknown chest state") {
+                            setAction(
+                                "API open confirmed — continuing Winners cleanup despite unknown chest state"
+                            );
+                        }
+                        setState(
+                            STATES.WAITING_FOR_WINNERS
+                        );
+                        return;
+                    }
+
+                    if (lastAction !== "Chest state UNKNOWN — waiting for reset detection") {
+                        setAction("Chest state UNKNOWN — waiting for reset detection");
+                    }
+                    return;
+                }
+
                 if (
-                    getChestState() ===
-                    "UNAVAILABLE"
+                    resetState === "UNAVAILABLE"
                 ) {
                     setAction(
                         "Chest reset detected"
@@ -3569,9 +4075,20 @@
                 }
 
                 return;
+            }
 
             case STATES.WAITING_FOR_WINNERS:
                 {
+                    if (
+                        getChestState() === "UNKNOWN" &&
+                        !chestOpenConfirmedForCycle
+                    ) {
+                        if (lastAction !== "Chest state UNKNOWN — waiting for Winners cleanup") {
+                            setAction("Chest state UNKNOWN — waiting for Winners cleanup");
+                        }
+                        return;
+                    }
+
                     const winners =
                         findWinnersPanel();
 
@@ -3616,6 +4133,16 @@
                 return;
 
             case STATES.CLEANUP:
+
+                if (
+                    getChestState() === "UNKNOWN" &&
+                    !chestOpenConfirmedForCycle
+                ) {
+                    if (lastAction !== "Chest state UNKNOWN — waiting for cleanup") {
+                        setAction("Chest state UNKNOWN — waiting for cleanup");
+                    }
+                    return;
+                }
 
                 if (
                     isChestModalOpen()
@@ -3759,9 +4286,7 @@
             state ===
                 STATES.CLOSING_BELOW_TARGET ||
             state ===
-                STATES.CLICKING_CHEST ||
-            state ===
-                STATES.CLICKING_OPEN ||
+                STATES.OPENING_VIA_API ||
             state ===
                 STATES.WAITING_FOR_RAIN ||
             state ===
@@ -4308,7 +4833,7 @@
                     </div>
 
                     <label class="ych-field">
-                        Threshold Likes
+                        Fallback Threshold Likes
                         <input
                             type="number"
                             min="500"
@@ -4631,7 +5156,7 @@
     }
 
     function toggleEnabled() {
-        if (!settings.enabled && !detectOwnBroadcasting()) {
+        if (!settings.enabled && !updateBroadcastSafety()) {
             setAction("Cannot turn automation ON — END button not found");
             return;
         }
@@ -5154,15 +5679,18 @@
 
         renderChestLog();
 
+        const freshChestApi =
+            getFreshChestApiSnapshot();
+
         setField(
             "chest",
-            getChestState()
+            getChestStateLabel()
         );
 
         /*
          * The important distinction:
          *
-         * Last Chest Check = actual last chest-panel reading.
+         * Last Chest Check = the latest likes reading used by a chest check.
          */
         setField(
             "last-check",
@@ -5176,18 +5704,18 @@
 
         setField(
             "likes",
-            currentLikes ===
-                null
-                ? "—"
-                : formatLikes(
-                    currentLikes
-                )
+            freshChestApi &&
+                freshChestApi.likes !== null
+                ? formatLikes(freshChestApi.likes)
+                : currentLikes !== null
+                    ? formatLikes(currentLikes)
+                    : "—"
         );
 
         setField(
             "target",
             formatLikes(
-                settings.threshold
+                getCurrentChestThreshold()
             )
         );
 
@@ -5317,7 +5845,7 @@
 
         installCSS();
 
-        /* Keep the original working v9.48 panel creation method. */
+        /* Keep the existing working helper panel creation method intact. */
         createHelperPanel();
 
         /* Audio is optional and initializes only after the panel exists. */
