@@ -1,9 +1,9 @@
 // ==UserScript==
 // @name         YouNow Treasure Chest Auto Opener
 // @namespace    https://younow.com/
-// @version      9.82
+// @version      9.84
 // @description  YouNow Treasure Chest helper with API live detection, username-resolved resizable chat, optional audio, and logs.
-// @author       James McKay
+// @author       Cenastor
 // @match        https://www.younow.com/*
 // @match        https://younow.com/*
 // @grant        GM_getValue
@@ -16,7 +16,7 @@
 (function () {
     "use strict";
 
-    const VERSION = "9.82";
+    const VERSION = "9.84";
 
     /*
      * Keep the existing storage key for compatibility.
@@ -66,13 +66,13 @@
         "https://cdn.younow.com/php/api/channel/getInfo/channelId=";
     const MAX_CHAT_AUTHOR_LOOKUP_CONCURRENCY = 2;
     const MAX_CHAT_AUTHOR_LOOKUPS_PER_PAGE = 200;
+    const MAX_CHAT_AVATAR_LOOKUPS_PER_PAGE = 40;
     const CHAT_AUTHOR_LOOKUP_RETRY_MS = 60000;
 
     const BROADCAST_INFO_REFRESH_INTERVAL_MS = 3000;
 
     const BROADCAST_INFO_SIGNAL_MAX_AGE_MS = 7000;
 
-    const NATIVE_CHAT_REFRESH_INTERVAL_MS = 900;
 
     const MAX_CHAT_FEED_MESSAGES = 200;
 
@@ -94,6 +94,7 @@
         threshold: 1000,
 
         recheckSeconds: 30,
+        chatRefreshSeconds: 3,
 
         openingDelaySeconds: 30,
 
@@ -529,11 +530,19 @@
     let chatFeedAutoScroll = true;
     let chatFeedIsPoppedOut = false;
     let chatFeedApiLastEntriesAt = 0;
+    let chatFeedLastRefreshAt = 0;
+    let chatFeedRefreshTimer = null;
+    let chatFeedClearAt = 0;
+    let chatFeedClearedKeys = new Set();
+    let chatFeedClearedTexts = new Set();
+    let chatComposerSendInProgress = false;
     let chatAuthorByUserId = new Map();
+    let chatAvatarByUserId = new Map();
     let broadcastAudienceLastFetchAt = 0;
     let broadcastAudienceRequestInFlight = false;
     let broadcastAudienceContextKey = "";
     let chatAuthorLookupLastAttemptAt = new Map();
+    let chatProfileLookupCompleted = new Set();
     let chatAuthorLookupQueue = [];
     let chatAuthorLookupInFlight = 0;
     let chatFeedDragState = {
@@ -587,6 +596,9 @@
                     10
                 ) || 30
             );
+
+        result.chatRefreshSeconds =
+            Math.max(1, Math.min(60, parseInt(result.chatRefreshSeconds, 10) || 3));
 
         result.openingDelaySeconds =
             Math.max(
@@ -1607,12 +1619,16 @@
             resetBroadcastInfoSnapshot();
             chatFeedMessages = [];
             chatFeedSeenKeys.clear();
+            chatFeedLastRefreshAt = 0;
+            chatFeedClearAt = 0;
+            chatFeedClearedKeys.clear();
+            chatFeedClearedTexts.clear();
             chatFeedApiLastEntriesAt = 0;
         }
 
         if (
             broadcastInfoRequestInFlight ||
-            (!force && Date.now() - broadcastInfoLastFetchAt < BROADCAST_INFO_REFRESH_INTERVAL_MS)
+            (!force && Date.now() - broadcastInfoLastFetchAt < Math.min(BROADCAST_INFO_REFRESH_INTERVAL_MS, getChatRefreshIntervalMs()))
         ) {
             return;
         }
@@ -1629,6 +1645,10 @@
             broadcastInfoContextKey = contextKey;
             chatFeedMessages = [];
             chatFeedSeenKeys.clear();
+            chatFeedLastRefreshAt = 0;
+            chatFeedClearAt = 0;
+            chatFeedClearedKeys.clear();
+            chatFeedClearedTexts.clear();
             chatFeedApiLastEntriesAt = 0;
         }
 
@@ -1678,18 +1698,23 @@
 
             if (errorCode === 0) {
                 void refreshBroadcastAudienceNames(false);
-                const entries = extractChatFeedRecords(payload);
-                if (entries.length) {
-                    mergeChatFeedEntries(entries);
-                    scheduleChatAuthorLookups(entries);
-                    chatFeedApiLastEntriesAt = Date.now();
-                    chatFeedStatus = `Broadcast API chat · ${chatFeedMessages.length} messages`;
-                } else if (chatFeedMessages.length) {
-                    chatFeedStatus = `Page chat mirror · ${chatFeedMessages.length} messages`;
-                } else {
-                    chatFeedStatus = "Broadcast is live · waiting for comments";
-                }
-            } else if (errorCode === 206) {
+                const chatRefreshDue =
+                    !chatFeedLastRefreshAt ||
+                    Date.now() - chatFeedLastRefreshAt >= getChatRefreshIntervalMs();
+                if (chatRefreshDue) {
+                    chatFeedLastRefreshAt = Date.now();
+                    const entries = extractChatFeedRecords(payload);
+                    if (entries.length) {
+                        mergeChatFeedEntries(entries);
+                        scheduleChatAuthorLookups(entries);
+                        chatFeedApiLastEntriesAt = Date.now();
+                        chatFeedStatus = `Broadcast API chat · ${chatFeedMessages.length} messages`;
+                    } else if (chatFeedMessages.length) {
+                        chatFeedStatus = `Page chat mirror · ${chatFeedMessages.length} messages`;
+                    } else {
+                        chatFeedStatus = "Broadcast is live · waiting for comments";
+                    }
+                }            } else if (errorCode === 206) {
                 chatFeedStatus = chatFeedMessages.length
                     ? `Broadcast offline · last ${chatFeedMessages.length} messages`
                     : "Broadcast offline (API error 206)";
@@ -3628,6 +3653,81 @@
         return Boolean(name && !/^\d+$/.test(name));
     }
 
+    function cleanChatAuthorName(value) {
+        return String(value || "")
+            .replace(/\s+/g, " ")
+            .trim()
+            .replace(/\s*(?:[·|]\s*)?(?:level|lvl|lv\.?)\s*[:#-]?\s*\d+\s*$/i, "")
+            .replace(/\s*(?:[·|]\s*\d+(?:\.\d+)?|\(\s*(?:level\s*)?\d+(?:\.\d+)?\s*\))\s*$/i, "")
+            .trim();
+    }
+
+    function normalizeChatAvatarUrl(value) {
+        if (typeof value !== "string" || !value.trim()) return "";
+        try {
+            const url = new URL(value.trim(), pageWindow.location.href);
+            if (url.protocol !== "https:" && url.protocol !== "http:") return "";
+            return url.href;
+        } catch (_) {
+            return "";
+        }
+    }
+
+    function findChatAvatarUrl(payload) {
+        const avatarFields = new Set([
+            "avatarUrl", "avatarImageUrl", "userAvatarUrl", "profileImageUrl",
+            "profilePictureUrl", "pictureUrl", "userImageUrl", "iconUrl",
+            "photoUrl", "thumbnailUrl", "portraitUrl", "avatar", "profileImage",
+            "profilePicture", "userImage", "picture", "photo"
+        ].map(normalizeChatKey));
+        const nestedUrlFields = new Set(
+            ["url", "src", "imageUrl", "original", "large", "medium"].map(normalizeChatKey)
+        );
+        const visited = new WeakSet();
+
+        function visit(value, depth) {
+            if (depth > 10 || value === null || value === undefined) return "";
+            if (typeof value === "string") {
+                const candidate = normalizeChatAvatarUrl(value);
+                return candidate && /\.(?:avif|gif|jpe?g|png|webp)(?:[?#]|$)/i.test(candidate)
+                    ? candidate
+                    : "";
+            }
+            if (typeof value !== "object" || visited.has(value)) return "";
+            visited.add(value);
+            if (Array.isArray(value)) {
+                for (const item of value) {
+                    const found = visit(item, depth + 1);
+                    if (found) return found;
+                }
+                return "";
+            }
+
+            for (const [key, candidate] of Object.entries(value)) {
+                if (avatarFields.has(normalizeChatKey(key))) {
+                    const found = typeof candidate === "string"
+                        ? normalizeChatAvatarUrl(candidate)
+                        : visit(candidate, depth + 1);
+                    if (found) return found;
+                }
+            }
+            for (const [key, child] of Object.entries(value)) {
+                if (nestedUrlFields.has(normalizeChatKey(key)) && typeof child === "string") {
+                    const found = normalizeChatAvatarUrl(child);
+                    if (found) return found;
+                }
+            }
+            for (const child of Object.values(value)) {
+                if (!child || typeof child !== "object") continue;
+                const found = visit(child, depth + 1);
+                if (found) return found;
+            }
+            return "";
+        }
+
+        return visit(payload, 0);
+    }
+
     function readChatAuthor(record) {
         const nameFields = [
             "username", "userName", "displayName", "nickname", "screenName", "name",
@@ -3637,7 +3737,7 @@
         ];
         const direct = findObjectValue(record, nameFields);
         if (isUsableChatAuthor(direct)) {
-            return String(direct).trim();
+            return cleanChatAuthorName(direct);
         }
 
         for (const key of [
@@ -3646,12 +3746,12 @@
         ]) {
             const person = findObjectValue(record, [key]);
             if (isUsableChatAuthor(person)) {
-                return String(person).trim();
+                return cleanChatAuthorName(person);
             }
             if (person && typeof person === "object") {
                 const name = findObjectValue(person, [...nameFields, "name"]);
                 if (isUsableChatAuthor(name)) {
-                    return String(name).trim();
+                    return cleanChatAuthorName(name);
                 }
             }
         }
@@ -3662,14 +3762,21 @@
         let changed = false;
         for (const entry of chatFeedMessages) {
             const userId = entry?.userId ? String(entry.userId) : "";
-            if (!userId || (entry.author && !/^(unknown sender|younow)$/i.test(entry.author))) continue;
-            const name = chatAuthorByUserId.get(userId);
-            if (!isUsableChatAuthor(name)) continue;
-            entry.author = name;
-            chatFeedSeenKeys.add(
-                `content:${String(name).toLowerCase()}|${String(entry.text).replace(/\s+/g, " ").trim().toLowerCase()}`
-            );
-            changed = true;
+            if (!userId) continue;
+            if (!entry.author || /^(unknown sender|younow)$/i.test(entry.author)) {
+                const name = chatAuthorByUserId.get(userId);
+                if (isUsableChatAuthor(name)) {
+                    entry.author = cleanChatAuthorName(name);
+                    changed = true;
+                }
+            }
+            if (!entry.avatarUrl) {
+                const avatarUrl = chatAvatarByUserId.get(userId);
+                if (avatarUrl) {
+                    entry.avatarUrl = avatarUrl;
+                    changed = true;
+                }
+            }
         }
         if (changed) renderChatFeed();
     }
@@ -3684,7 +3791,9 @@
             broadcastAudienceContextKey = contextKey;
             broadcastAudienceLastFetchAt = 0;
             chatAuthorByUserId.clear();
+            chatAvatarByUserId.clear();
             chatAuthorLookupLastAttemptAt.clear();
+            chatProfileLookupCompleted.clear();
             chatAuthorLookupQueue = [];
         }
         if (
@@ -3725,7 +3834,11 @@
                     "name", "username", "userName", "displayName", "nickname", "screenName"
                 ]);
                 if (userId !== undefined && isUsableChatAuthor(name)) {
-                    chatAuthorByUserId.set(String(userId), String(name).trim());
+                    chatAuthorByUserId.set(String(userId), cleanChatAuthorName(name));
+                }
+                if (userId !== undefined) {
+                    const avatarUrl = findChatAvatarUrl(person);
+                    if (avatarUrl) chatAvatarByUserId.set(String(userId), avatarUrl);
                 }
             }
             applyChatAuthorMap();
@@ -3760,7 +3873,7 @@
             }
 
             const direct = findObjectValue(value, usernameFields);
-            if (isUsableChatAuthor(direct)) return String(direct).trim();
+            if (isUsableChatAuthor(direct)) return cleanChatAuthorName(direct);
 
             const preferred = ["user", "channel", "profile", "userInfo", "channelInfo", "data", "result", "info"];
             for (const key of preferred) {
@@ -3801,8 +3914,13 @@
             }
 
             const username = findChannelInfoUsername(payload);
-            if (!isUsableChatAuthor(username)) return;
-            chatAuthorByUserId.set(String(userId), username);
+            if (isUsableChatAuthor(username)) {
+                chatAuthorByUserId.set(String(userId), cleanChatAuthorName(username));
+            }
+            const avatarUrl = findChatAvatarUrl(payload);
+            if (avatarUrl) chatAvatarByUserId.set(String(userId), avatarUrl);
+            chatProfileLookupCompleted.add(String(userId));
+            if (!isUsableChatAuthor(username) && !avatarUrl) return;
             applyChatAuthorMap();
         } catch (_) {
             /* Name lookups are optional; the comment remains visible without a resolved username. */
@@ -3830,16 +3948,18 @@
         const contextKey = broadcastAudienceContextKey;
         if (!contextKey) return;
 
-        for (const entry of entries) {
+        for (const entry of entries.slice(-MAX_CHAT_AVATAR_LOOKUPS_PER_PAGE).reverse()) {
             const userId = entry?.userId ? String(entry.userId) : "";
             const isPlaceholder = !entry?.author || /^(unknown sender|younow)$/i.test(String(entry.author).trim());
-            if (!userId || !isPlaceholder || chatAuthorByUserId.has(userId)) continue;
+            const needsName = isPlaceholder && !chatAuthorByUserId.has(userId);
+            const needsAvatar = !entry?.avatarUrl && !chatAvatarByUserId.has(userId);
+            if (!userId || (!needsName && !needsAvatar) || chatProfileLookupCompleted.has(userId)) continue;
 
             const lastAttemptAt = chatAuthorLookupLastAttemptAt.get(userId) || 0;
             if (Date.now() - lastAttemptAt < CHAT_AUTHOR_LOOKUP_RETRY_MS) continue;
             if (
                 !chatAuthorLookupLastAttemptAt.has(userId) &&
-                chatAuthorLookupLastAttemptAt.size >= MAX_CHAT_AUTHOR_LOOKUPS_PER_PAGE
+                chatAuthorLookupLastAttemptAt.size >= MAX_CHAT_AUTHOR_LOOKUPS_PER_PAGE + MAX_CHAT_AVATAR_LOOKUPS_PER_PAGE
             ) {
                 continue;
             }
@@ -3872,8 +3992,8 @@
         ]);
         let text = readChatText(textValue);
 
+        const gift = findObjectValue(record, ["giftName", "propName", "gift", "prop"]);
         if (!text) {
-            const gift = findObjectValue(record, ["giftName", "propName", "gift", "prop"]);
             const giftText = readChatText(gift) ||
                 readChatText(findObjectValue(gift, ["name", "title", "displayName"]));
             if (giftText) text = `Sent ${giftText}`;
@@ -3891,13 +4011,20 @@
         const id = idValue === undefined ? "" : String(idValue);
         const key = id
             ? `id:${id}`
-            : `${timestampMs ?? ""}|${author}|${text}`;
+            : timestampMs !== null
+                ? `${timestampMs}|${userId}|${text}`
+                : `record:${path}|${userId}|${text}`;
+        const isGift = Boolean(gift) || /\b(?:gift|sticker|prop)\b/i.test(text);
 
         return {
             key,
-            author: author || "Unknown sender",
+            source: "api",
+            sourceSet: new Set(["api"]),
+            author: author ? cleanChatAuthorName(author) : "Unknown sender",
             userId,
             text,
+            isGift,
+            avatarUrl: findChatAvatarUrl(record) || chatAvatarByUserId.get(userId) || "",
             timestampMs
         };
     }
@@ -3913,8 +4040,12 @@
             if (!text) return;
             results.push({
                 key: `text:${path}:${text}`,
+                source: "api",
+                sourceSet: new Set(["api"]),
                 author: "Unknown sender",
                 text,
+                isGift: /\b(?:gift|sticker|prop)\b/i.test(text),
+                avatarUrl: "",
                 timestampMs: null
             });
         }
@@ -4057,7 +4188,7 @@
         return candidates;
     }
 
-    function extractNativeChatEntry(row) {
+    function extractNativeChatEntry(row, rowIndex = 0) {
         const textOf = element => String(element?.innerText || element?.textContent || "")
             .replace(/\u00a0/g, " ")
             .replace(/\s+/g, " ")
@@ -4072,7 +4203,11 @@
             authorNode?.getAttribute("data-user-name") ||
             authorNode?.getAttribute("aria-label") ||
             authorNode?.getAttribute("title") || "";
-        let author = (textOf(authorNode) || authorAttribute).slice(0, 80);
+        const authorCopy = authorNode?.cloneNode(true);
+        authorCopy?.querySelectorAll(
+            '[class*="level"],[class*="Level"],[class*="rank"],[class*="Rank"],[class*="user-badge"],[class*="userBadge"]'
+        ).forEach(element => element.remove());
+        let author = cleanChatAuthorName((textOf(authorCopy) || authorAttribute).slice(0, 80));
         if (!isUsableChatAuthor(author)) author = "Unknown sender";
         let text = rawText;
         if (author !== "Unknown sender" && text.toLowerCase().startsWith(author.toLowerCase())) {
@@ -4088,13 +4223,36 @@
         const id = row.getAttribute("data-message-id") ||
             row.getAttribute("data-id") ||
             row.id || "";
+        const userIdNode = row.matches?.("[data-user-id],[data-userid],[data-author-id],[data-sender-id]")
+            ? row
+            : row.querySelector("[data-user-id],[data-userid],[data-author-id],[data-sender-id]");
+        const userIdRaw = userIdNode?.getAttribute("data-user-id") ||
+            userIdNode?.getAttribute("data-userid") ||
+            userIdNode?.getAttribute("data-author-id") ||
+            userIdNode?.getAttribute("data-sender-id") || "";
+        const profileHref = authorNode?.closest("a[href]")?.getAttribute("href") ||
+            row.querySelector('a[href*="/user/"],a[href*="/profile/"]')?.getAttribute("href") || "";
+        const profileIdMatch = profileHref.match(/(?:user|profile)\/(\d+)|channelId=(\d+)/i);
+        const userId = String(userIdRaw || profileIdMatch?.[1] || profileIdMatch?.[2] || "");
+        const avatarNode = row.querySelector(
+            'img[class*="avatar"],img[class*="Avatar"],img[class*="profile"],img[class*="Profile"],[class*="avatar"] img,[class*="Avatar"] img,[data-avatar] img,img[alt*="avatar" i],img[alt*="profile" i]'
+        );
+        const avatarUrl = normalizeChatAvatarUrl(
+            avatarNode?.currentSrc || avatarNode?.getAttribute("src") ||
+            avatarNode?.getAttribute("data-src") || avatarNode?.getAttribute("data-original") || ""
+        ) || chatAvatarByUserId.get(userId) || "";
 
         return {
             key: id
                 ? `native:${id}`
-                : `native:${timestampMs ?? ""}|${author}|${text}`,
+                : `native:${timestampMs ?? ""}|${userId}|${author}|${text}|${timestampMs === null ? rowIndex : ""}`,
+            source: "native",
+            sourceSet: new Set(["native"]),
             author,
+            userId,
             text,
+            isGift: /\b(?:gift|sticker|prop)\b/i.test(text),
+            avatarUrl,
             timestampMs
         };
     }
@@ -4104,24 +4262,52 @@
         for (const entry of entries) {
             if (!entry?.text) continue;
             const normalizedText = String(entry.text).replace(/\s+/g, " ").trim().toLowerCase();
-            const contentKey = `content:${String(entry.author || "").toLowerCase()}|${normalizedText}`;
-            const sameTextIndex = chatFeedMessages.findIndex(message =>
-                String(message.text).replace(/\s+/g, " ").trim().toLowerCase() === normalizedText
-            );
-            if (sameTextIndex >= 0) {
-                const existing = chatFeedMessages[sameTextIndex];
-                if (isUnknownAuthor(existing.author) && !isUnknownAuthor(entry.author)) {
-                    existing.author = entry.author;
-                    existing.timestampMs = entry.timestampMs || existing.timestampMs;
-                    chatFeedSeenKeys.add(entry.key);
-                    chatFeedSeenKeys.add(contentKey);
-                    continue;
+            const timestampMs = Number.isFinite(entry.timestampMs) ? entry.timestampMs : null;
+            const clearedText = chatFeedClearedTexts.has(normalizedText);
+            const isAfterClear = Boolean(chatFeedClearAt && timestampMs && timestampMs > chatFeedClearAt);
+            const source = String(entry.source || "unknown");
+
+            if (chatFeedClearedKeys.has(entry.key)) continue;
+            if (chatFeedClearAt && timestampMs !== null && timestampMs <= chatFeedClearAt) continue;
+            if (clearedText && !isAfterClear && !entry.isGift) continue;
+            if (chatFeedSeenKeys.has(entry.key)) continue;
+
+            const sourceMatch = chatFeedMessages.find(message => {
+                const messageText = String(message.text).replace(/\s+/g, " ").trim().toLowerCase();
+                const messageSources = message.sourceSet instanceof Set
+                    ? message.sourceSet
+                    : new Set([String(message.source || "unknown")]);
+                const messageAuthor = String(message.author || "").trim().toLowerCase();
+                const entryAuthor = String(entry.author || "").trim().toLowerCase();
+                const authorMatches = messageAuthor === entryAuthor ||
+                    isUnknownAuthor(message.author) || isUnknownAuthor(entry.author);
+                const messageTimestampMs = Number.isFinite(message.timestampMs)
+                    ? Number(message.timestampMs)
+                    : null;
+                const timeMatches = timestampMs !== null && messageTimestampMs !== null
+                    ? Math.abs(messageTimestampMs - timestampMs) <= 5000
+                    : Date.now() - Number(message.receivedAt || 0) <= 5000;
+                return messageText === normalizedText && authorMatches &&
+                    !messageSources.has(source) &&
+                    timeMatches;
+            });
+            if (sourceMatch) {
+                if (sourceMatch.sourceSet instanceof Set) sourceMatch.sourceSet.add(source);
+                else sourceMatch.sourceSet = new Set([sourceMatch.source || "unknown", source]);
+                if (isUnknownAuthor(sourceMatch.author) && !isUnknownAuthor(entry.author)) {
+                    sourceMatch.author = cleanChatAuthorName(entry.author);
                 }
-                if (!isUnknownAuthor(existing.author) && isUnknownAuthor(entry.author)) continue;
+                if (!sourceMatch.avatarUrl && entry.avatarUrl) sourceMatch.avatarUrl = entry.avatarUrl;
+                chatFeedSeenKeys.add(entry.key);
+                continue;
             }
-            if (chatFeedSeenKeys.has(entry.key) || chatFeedSeenKeys.has(contentKey)) continue;
+
+            entry.author = cleanChatAuthorName(entry.author) || "Unknown sender";
+            entry.sourceSet = entry.sourceSet instanceof Set
+                ? entry.sourceSet
+                : new Set([source]);
+            entry.receivedAt = Date.now();
             chatFeedSeenKeys.add(entry.key);
-            chatFeedSeenKeys.add(contentKey);
             chatFeedMessages.push(entry);
         }
         if (chatFeedMessages.length > MAX_CHAT_FEED_MESSAGES) {
@@ -4131,13 +4317,9 @@
             chatFeedSeenKeys = new Set();
             for (const entry of chatFeedMessages) {
                 chatFeedSeenKeys.add(entry.key);
-                chatFeedSeenKeys.add(
-                    `content:${String(entry.author || "").toLowerCase()}|${String(entry.text).replace(/\s+/g, " ").trim().toLowerCase()}`
-                );
             }
         }
     }
-
     function refreshChatFeedFromPage() {
         if (!chatFeedWidget) return;
         if (hasFreshBroadcastInfoSignal() && Number(broadcastInfoSnapshot?.errorCode) === 206) {
@@ -4155,7 +4337,7 @@
         }
 
         const entries = findNativeChatRows(root)
-            .map(extractNativeChatEntry)
+            .map((row, index) => extractNativeChatEntry(row, index))
             .filter(Boolean);
         const apiHasRecentMessages = Date.now() - chatFeedApiLastEntriesAt < 10000;
         mergeChatFeedEntries(entries);
@@ -4167,6 +4349,24 @@
         renderChatFeed();
     }
 
+    function getChatRefreshIntervalMs() {
+        const seconds = Math.max(1, Math.min(60, parseInt(settings.chatRefreshSeconds, 10) || 3));
+        return seconds * 1000;
+    }
+
+    function scheduleChatFeedRefresh() {
+        if (chatFeedRefreshTimer !== null) clearTimeout(chatFeedRefreshTimer);
+        chatFeedRefreshTimer = setTimeout(() => {
+            chatFeedRefreshTimer = null;
+            try {
+                refreshChatFeedFromPage();
+            } catch (error) {
+                console.warn("[Chest Helper] Chat refresh failed:", error);
+            } finally {
+                scheduleChatFeedRefresh();
+            }
+        }, getChatRefreshIntervalMs());
+    }
     function renderChatFeed() {
         if (!chatFeedWidget) return;
         const feed = chatFeedWidget.querySelector('[data-field="chat-feed"]');
@@ -4185,14 +4385,28 @@
         } else {
             feed.innerHTML = chatFeedMessages.map(message => {
                 const time = formatChatTime(message.timestampMs);
+                const displayName = cleanChatAuthorName(message.author) || "Unknown sender";
+                const initials = displayName.replace(/[^a-z0-9]/gi, "").slice(0, 2).toUpperCase() || "?";
+                const avatarUrl = normalizeChatAvatarUrl(message.avatarUrl || "");
                 return `<div class="ych-chat-entry">
-                    <div class="ych-chat-entry-top">
-                        <strong>${escapeHtml(message.author)}</strong>
-                        ${time ? `<time>${escapeHtml(time)}</time>` : ""}
+                    <div class="ych-chat-entry-row">
+                        <span class="ych-chat-avatar" aria-hidden="true">
+                            ${escapeHtml(initials)}
+                            ${avatarUrl ? `<img src="${escapeHtml(avatarUrl)}" alt="" loading="lazy" referrerpolicy="no-referrer">` : ""}
+                        </span>
+                        <div class="ych-chat-entry-content">
+                            <div class="ych-chat-entry-top">
+                                <strong>${escapeHtml(displayName)}</strong>
+                                ${time ? `<time>${escapeHtml(time)}</time>` : ""}
+                            </div>
+                            <div class="ych-chat-entry-text">${escapeHtml(message.text)}</div>
+                        </div>
                     </div>
-                    <div class="ych-chat-entry-text">${escapeHtml(message.text)}</div>
                 </div>`;
             }).join("");
+            for (const image of feed.querySelectorAll(".ych-chat-avatar img")) {
+                image.addEventListener("error", () => image.remove(), { once: true });
+            }
         }
 
         if (chatFeedAutoScroll || wasAtBottom) {
@@ -4201,6 +4415,54 @@
         }
     }
 
+    function clearChatFeed() {
+        chatFeedClearAt = Date.now();
+        for (const entry of chatFeedMessages) {
+            if (entry?.key) chatFeedClearedKeys.add(entry.key);
+            const textKey = String(entry?.text || "").replace(/\s+/g, " ").trim().toLowerCase();
+            if (textKey) chatFeedClearedTexts.add(textKey);
+        }
+        while (chatFeedClearedKeys.size > 1000) {
+            chatFeedClearedKeys.delete(chatFeedClearedKeys.values().next().value);
+        }
+        while (chatFeedClearedTexts.size > 1000) {
+            chatFeedClearedTexts.delete(chatFeedClearedTexts.values().next().value);
+        }
+        chatFeedMessages = [];
+        chatFeedLastRefreshAt = chatFeedClearAt;
+        chatFeedStatus = "Chat cleared · waiting for new messages";
+        const input = chatFeedWidget?.querySelector('[data-field="chat-compose-input"]');
+        if (input) input.value = "";
+        renderChatFeed();
+    }
+
+    async function sendChatFromComposer() {
+        if (chatComposerSendInProgress) return;
+        const input = chatFeedWidget?.querySelector('[data-field="chat-compose-input"]');
+        const button = chatFeedWidget?.querySelector('[data-action="send-chat"]');
+        const message = String(input?.value || "").trim();
+        if (!message) return;
+
+        chatComposerSendInProgress = true;
+        if (button) {
+            button.disabled = true;
+            button.textContent = "SENDING";
+        }
+        try {
+            const sent = await sendChatMessage(message);
+            if (sent) {
+                input.value = "";
+                chatFeedStatus = "Message sent · waiting for chat refresh";
+                renderChatFeed();
+            }
+        } finally {
+            chatComposerSendInProgress = false;
+            if (button) {
+                button.disabled = false;
+                button.textContent = "SEND";
+            }
+        }
+    }
     function toggleChatPopout() {
         if (!helperPanel || !chatFeedWidget) return;
         const slot = helperPanel.querySelector('[data-field="chat-dock-slot"]');
@@ -4235,7 +4497,7 @@
         if (
             !chatFeedIsPoppedOut ||
             event.button !== 0 ||
-            event.target?.closest('[data-action="popout-chat"]')
+            event.target?.closest('button')
         ) {
             return;
         }
@@ -5927,7 +6189,7 @@
                 padding:8px;
             }
 
-            #ych-live-chat-panel-v982 .ych-chat-panel-head {
+            #ych-live-chat-panel-v984 .ych-chat-panel-head {
                 display:flex;
                 align-items:center;
                 justify-content:space-between;
@@ -5935,13 +6197,13 @@
                 margin-bottom:7px;
             }
 
-            #ych-live-chat-panel-v982.ych-chat-popout .ych-chat-panel-head {
+            #ych-live-chat-panel-v984.ych-chat-popout .ych-chat-panel-head {
                 cursor:move;
                 user-select:none;
                 touch-action:none;
             }
 
-            #ych-live-chat-panel-v982 .ych-chat-panel-title {
+            #ych-live-chat-panel-v984 .ych-chat-panel-title {
                 color:#aaa;
                 font-size:11px;
                 font-weight:700;
@@ -5949,7 +6211,7 @@
                 letter-spacing:.5px;
             }
 
-            #ych-live-chat-panel-v982 [data-action="popout-chat"] {
+            #ych-live-chat-panel-v984 [data-action="popout-chat"] {
                 min-height:25px;
                 padding:3px 8px;
                 border:1px solid #555;
@@ -5961,14 +6223,72 @@
                 cursor:pointer;
             }
 
-            #ych-live-chat-panel-v982 .ych-chat-status {
+            #ych-live-chat-panel-v984 .ych-chat-panel-actions {
+                display:flex;
+                align-items:center;
+                gap:5px;
+            }
+
+            #ych-live-chat-panel-v984 .ych-chat-panel-actions button {
+                min-height:25px;
+                padding:3px 7px;
+                border:1px solid #555;
+                border-radius:5px;
+                background:#333;
+                color:#fff;
+                font-size:10px;
+                font-weight:700;
+                white-space:nowrap;
+                cursor:pointer;
+            }
+
+            #ych-live-chat-panel-v984 .ych-chat-panel-actions button:disabled,
+            #ych-live-chat-panel-v984 .ych-chat-compose button:disabled {
+                opacity:.6;
+                cursor:wait;
+            }
+
+            #ych-live-chat-panel-v984 .ych-chat-compose {
+                display:flex;
+                flex:0 0 auto;
+                gap:6px;
+                margin-top:8px;
+            }
+
+            #ych-live-chat-panel-v984 .ych-chat-compose input {
+                flex:1 1 auto;
+                min-width:0;
+                min-height:30px;
+                box-sizing:border-box;
+                padding:5px 8px;
+                border:1px solid #555;
+                border-radius:5px;
+                background:#111;
+                color:#eee;
+                font-size:11px;
+            }
+
+            #ych-live-chat-panel-v984 .ych-chat-compose button {
+                flex:0 0 auto;
+                min-width:48px;
+                min-height:30px;
+                padding:4px 8px;
+                border:1px solid #555;
+                border-radius:5px;
+                background:#333;
+                color:#fff;
+                font-size:10px;
+                font-weight:700;
+                cursor:pointer;
+            }
+            #ych-live-chat-panel-v984 .ych-chat-status {
                 margin-bottom:6px;
                 color:#888;
                 font-size:10px;
                 line-height:1.4;
             }
 
-            #ych-live-chat-panel-v982 .ych-chat-feed {
+            #ych-live-chat-panel-v984 .ych-chat-feed {
                 max-height:210px;
                 overflow-y:auto;
                 padding-right:4px;
@@ -5978,16 +6298,52 @@
                 overscroll-behavior:contain;
             }
 
-            #ych-live-chat-panel-v982 .ych-chat-entry {
+            #ych-live-chat-panel-v984 .ych-chat-entry {
                 padding:7px;
                 border-bottom:1px solid #2f2f2f;
             }
 
-            #ych-live-chat-panel-v982 .ych-chat-entry:last-child {
+            #ych-live-chat-panel-v984 .ych-chat-entry-row {
+                display:flex;
+                align-items:flex-start;
+                gap:8px;
+            }
+
+            #ych-live-chat-panel-v984 .ych-chat-avatar {
+                position:relative;
+                width:26px;
+                height:26px;
+                flex:0 0 26px;
+                overflow:hidden;
+                border-radius:50%;
+                background:#26332a;
+                color:#a8dca8;
+                display:flex;
+                align-items:center;
+                justify-content:center;
+                font-size:10px;
+                font-weight:700;
+            }
+
+            #ych-live-chat-panel-v984 .ych-chat-avatar img {
+                position:absolute;
+                inset:0;
+                width:100%;
+                height:100%;
+                object-fit:cover;
+                border-radius:50%;
+            }
+
+            #ych-live-chat-panel-v984 .ych-chat-entry-content {
+                min-width:0;
+                flex:1;
+            }
+
+            #ych-live-chat-panel-v984 .ych-chat-entry:last-child {
                 border-bottom:0;
             }
 
-            #ych-live-chat-panel-v982 .ych-chat-entry-top {
+            #ych-live-chat-panel-v984 .ych-chat-entry-top {
                 display:flex;
                 justify-content:space-between;
                 gap:8px;
@@ -5995,13 +6351,13 @@
                 font-size:11px;
             }
 
-            #ych-live-chat-panel-v982 .ych-chat-entry-top time {
+            #ych-live-chat-panel-v984 .ych-chat-entry-top time {
                 color:#777;
                 font-size:10px;
                 white-space:nowrap;
             }
 
-            #ych-live-chat-panel-v982 .ych-chat-entry-text {
+            #ych-live-chat-panel-v984 .ych-chat-entry-text {
                 margin-top:3px;
                 color:#ddd;
                 font-size:11px;
@@ -6010,14 +6366,14 @@
                 overflow-wrap:anywhere;
             }
 
-            #ych-live-chat-panel-v982 .ych-chat-empty {
+            #ych-live-chat-panel-v984 .ych-chat-empty {
                 padding:12px 8px;
                 color:#777;
                 text-align:center;
                 font-size:11px;
             }
 
-            #ych-live-chat-panel-v982.ych-chat-popout {
+            #ych-live-chat-panel-v984.ych-chat-popout {
                 position:fixed;
                 right:20px;
                 bottom:20px;
@@ -6043,7 +6399,7 @@
                 font-family:Arial,Helvetica,sans-serif;
             }
 
-            #ych-live-chat-panel-v982.ych-chat-popout .ych-chat-feed {
+            #ych-live-chat-panel-v984.ych-chat-popout .ych-chat-feed {
                 flex:1 1 auto;
                 height:0;
                 min-height:100px;
@@ -6408,6 +6764,17 @@
                     </label>
 
                     <label class="ych-field">
+                        Chat Refresh Delay (Seconds)
+                        <input
+                            type="number"
+                            min="1"
+                            max="60"
+                            step="1"
+                            data-setting="chatRefreshSeconds"
+                        >
+                    </label>
+
+                    <label class="ych-field">
                         Opening Delay Seconds
                         <input
                             type="number"
@@ -6560,14 +6927,14 @@
 
                 <div
                     class="ych-section ych-chat-panel"
-                    id="ych-live-chat-panel-v982"
+                    id="ych-live-chat-panel-v984"
                 >
                     <div class="ych-chat-panel-head">
                         <div class="ych-chat-panel-title">Live Chat</div>
-                        <button
-                            type="button"
-                            data-action="popout-chat"
-                        >POP OUT</button>
+                        <div class="ych-chat-panel-actions">
+                            <button type="button" data-action="clear-chat" title="Clear this helper chat display only">CLEAR CHAT</button>
+                            <button type="button" data-action="popout-chat">POP OUT</button>
+                        </div>
                     </div>
                     <div
                         class="ych-chat-status"
@@ -6578,6 +6945,10 @@
                         data-field="chat-feed"
                         aria-live="polite"
                     ></div>
+                    <div class="ych-chat-compose">
+                        <input type="text" maxlength="500" data-field="chat-compose-input" placeholder="Write a chat message..." aria-label="Write a chat message" autocomplete="off">
+                        <button type="button" data-action="send-chat">SEND</button>
+                    </div>
                 </div>
 
                 <div class="ych-buttons">
@@ -6622,7 +6993,7 @@
             helperPanel
         );
 
-        chatFeedWidget = helperPanel.querySelector("#ych-live-chat-panel-v982");
+        chatFeedWidget = helperPanel.querySelector("#ych-live-chat-panel-v984");
 
         chatFeedWidget?.querySelector('[data-field="chat-feed"]')?.addEventListener(
             "scroll",
@@ -6761,6 +7132,9 @@
                 ) || 1
             );
 
+        settings.chatRefreshSeconds =
+            Math.max(1, Math.min(60, parseInt(settings.chatRefreshSeconds, 10) || 3));
+
         settings.openingDelaySeconds =
             Math.max(
                 0,
@@ -6789,6 +7163,7 @@
         }
 
         scheduleAutoInfo();
+        scheduleChatFeedRefresh();
 
         setAction(
             "Settings saved"
@@ -7153,6 +7528,22 @@
             sendTestChatMessage
         );
 
+        chatFeedWidget?.querySelector('[data-action="clear-chat"]')?.addEventListener(
+            "click",
+            clearChatFeed
+        );
+
+        const chatComposerInput = chatFeedWidget?.querySelector('[data-field="chat-compose-input"]');
+        chatFeedWidget?.querySelector('[data-action="send-chat"]')?.addEventListener(
+            "click",
+            sendChatFromComposer
+        );
+        chatComposerInput?.addEventListener("keydown", event => {
+            if (event.key === "Enter") {
+                event.preventDefault();
+                void sendChatFromComposer();
+            }
+        });
         chatFeedWidget?.querySelector(
             '[data-action="popout-chat"]'
         )?.addEventListener(
@@ -7562,10 +7953,7 @@
             updateUI();
         });
 
-        setInterval(
-            refreshChatFeedFromPage,
-            NATIVE_CHAT_REFRESH_INTERVAL_MS
-        );
+        scheduleChatFeedRefresh();
 
         if (ownBroadcastActive && settings.enabled) {
             scheduleAutoInfo();
